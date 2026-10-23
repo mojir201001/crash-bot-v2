@@ -1,67 +1,7 @@
-﻿async function sendTelegram(env, chatId, text, keyboard) {
-  const response = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        reply_markup: {
-          keyboard,
-          resize_keyboard: true,
-          is_persistent: true
-        }
-      })
-    }
-  );
+﻿import { sendTelegram } from "./telegram/api.js";
+import { userMenu, adminMenu } from "./telegram/keyboards.js";
 
-  if (!response.ok) {
-    console.error("Telegram sendMessage failed:", response.status);
-    return false;
-  }
 
-  const result = await response.json();
-  return result.ok === true;
-}
-
-function userMenu(isStaff) {
-  const keyboard = [
-    [{ text: "👤 پروفایل من" }, { text: "💌 ثبت پست کراش" }],
-    [{ text: "🎭 ارتباط ناشناس" }, { text: "🤝 درخواست‌های ارتباط از کانال" }],
-    [{ text: "📢 ثبت درخواست تبلیغات" }, { text: "📖 راهنما و قوانین" }]
-  ];
-
-  if (isStaff) {
-    keyboard.push([{ text: "🛠 پنل مدیریت" }]);
-  }
-
-  return keyboard;
-}
-
-function adminMenu(isOwner) {
-  const keyboard = [
-    [{ text: "🔎 بررسی پیام‌های ناشناس" }],
-    [{ text: "🗂 آرشیو پیام‌های ناشناس" }],
-    [{ text: "📢 درخواست‌های تبلیغات" }],
-    [{ text: "👤 پنل کاربر" }]
-  ];
-
-  if (isOwner) {
-    keyboard.splice(3, 0,
-      [{ text: "🗃 آرشیو پیام‌های کانال" }],
-      [{ text: "💬 آرشیو چت‌های کاربران" }],
-      [{ text: "🎭 آرشیو ارتباط ناشناس" }],
-      [{ text: "📣 پیام همگانی" }],
-      [{ text: "📖 ویرایش راهنما و قوانین" }],
-      [{ text: "🔗 عضویت اجباری" }],
-      [{ text: "⚙️ تنظیمات ربات" }],
-      [{ text: "👥 مدیریت ادمین‌ها" }]
-    );
-  }
-
-  return keyboard;
-}
 
 export default {
   async fetch(request, env) {
