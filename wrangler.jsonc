@@ -10,7 +10,14 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	"d1_databases": [
+		{
+			"binding": "CRASH_BOT_DB",
+			"database_name": "crash-bot-v2-db",
+			"database_id": "1671af11-2d1c-4ba6-918f-b4c4a2421c55"
+		}
+	]
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
