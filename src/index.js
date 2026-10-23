@@ -1,8 +1,6 @@
 ﻿import { sendTelegram } from "./telegram/api.js";
 import { userMenu, adminMenu } from "./telegram/keyboards.js";
 
-
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -18,9 +16,16 @@ export default {
       return Response.json({ error: "Not found" }, { status: 404 });
     }
 
+    const secret = request.headers.get(
+      "X-Telegram-Bot-Api-Secret-Token"
+    );
+
+    if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) {
+      return Response.json({ ok: false }, { status: 401 });
+    }
+
     if (
       !env.TELEGRAM_BOT_TOKEN ||
-      !env.WEBHOOK_SECRET ||
       !env.OWNER_TELEGRAM_ID ||
       !env.CRASH_BOT_DB
     ) {
@@ -29,15 +34,6 @@ export default {
         { status: 503 }
       );
     }
-
-    const secret = request.headers.get(
-      "X-Telegram-Bot-Api-Secret-Token"
-    );
-
-    if (secret !== env.WEBHOOK_SECRET) {
-      return Response.json({ ok: false }, { status: 401 });
-    }
-
     let update;
 
     try {
@@ -213,3 +209,5 @@ export default {
     }
   }
 };
+
+

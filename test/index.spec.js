@@ -39,7 +39,8 @@ describe("Crash Bot worker", () => {
     const response = await worker.fetch(request, env, ctx);
     await waitOnExecutionContext(ctx);
 
-    expect(response.status).toBe(503);
+    expect(response.status).toBe(401);
   });
 });
+
 
