@@ -41,12 +41,12 @@ export async function sendTelegram(env, chatId, text, keyboard) {
   const result = await telegramRequest(env, "sendMessage", {
     chat_id: chatId,
     text,
-    ...(keyboard ? {
-      reply_markup: {
+    ...(Array.isArray(keyboard) ? {
+      reply_markup: keyboard.length ? {
         keyboard,
         resize_keyboard: true,
         is_persistent: false
-      }
+      } : { remove_keyboard: true }
     } : {})
   });
 
@@ -272,12 +272,12 @@ export async function sendTrackedSectionNoticeTelegram(env, chatId, text, keyboa
   const result = await telegramRequest(env, "sendMessage", {
     chat_id: chatId,
     text,
-    ...(keyboard ? {
-      reply_markup: {
+    ...(Array.isArray(keyboard) ? {
+      reply_markup: keyboard.length ? {
         keyboard,
         resize_keyboard: true,
         is_persistent: false
-      }
+      } : { remove_keyboard: true }
     } : {})
   });
 

@@ -171,8 +171,9 @@ describe("Crash Bot worker", () => {
   });
 });
 
-  it("opens the user menu when the user presses /start", async () => {
-    const sendSpy = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+  it("requires profile completion when the user presses /start", async () => {
+    const screenSpy = vi.spyOn(telegramApi, "sendTrackedSectionNoticeTelegram")
+      .mockResolvedValue(true);
 
     vi.spyOn(env.CRASH_BOT_DB, "prepare").mockImplementation((query) => {
       if (query.includes("INSERT INTO users")) {
@@ -214,9 +215,10 @@ describe("Crash Bot worker", () => {
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    expect(sendSpy).toHaveBeenCalled();
-    expect(sendSpy.mock.calls.some((call) =>
-      String(call[2]).includes("به کراش‌یاب ادیب خوش اومدی")
+    expect(screenSpy).toHaveBeenCalled();
+    expect(screenSpy.mock.calls.some((call) =>
+      String(call[2]).includes("تکمیل پروفایل") &&
+      String(call[2]).includes("لقب اجباری")
     )).toBe(true);
   });
 

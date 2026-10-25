@@ -1,4 +1,4 @@
-import { sendTelegram, deleteTelegramMessage, clearTrackedSectionMessage, sendTrackedSectionNoticeTelegram, sendTrackedMainScreenTelegram } from "./telegram/api.js";
+import { sendTelegram, deleteTelegramMessage, clearTrackedSectionMessage, answerCallbackQuery } from "./telegram/api.js";
 import { userMenu, adminMenu, sectionMenu, stage3Menu, stage3Routes, stage3ScreenText, stage3ScreenIds, stage3Permissions } from "./telegram/keyboards.js";
 import { getUserRole, canAccess } from "./services/permissions.js";
 import {
@@ -12,6 +12,13 @@ import {
   handleForcedMembershipMessage,
   handleForcedMembershipChatUpdate
 } from "./services/forced-membership-panel.js";
+import {
+  handleProfileRoute,
+  handleProfileWorkflowMessage,
+  hasSupportedMedia,
+  isProfileReady,
+  startProfileFlow
+} from "./services/profile-flow.js";
 
 const VERIFY_BUTTON = "🔄 بررسی عضویت";
 const MEMBERSHIP_BUTTON = "🔗 عضویت اجباری";
@@ -24,6 +31,9 @@ const UI_TAP_TEXTS = new Set([
   "👤 پنل کاربر",
   "🔄 بررسی عضویت",
   "👤 پروفایل من",
+  "✏️ ویرایش اطلاعات",
+  "❤️ علاقه‌مندی‌های من",
+  "➕ افزودن علاقه‌مندی",
   "💌 ثبت پست کراش",
   "🎭 ارتباط ناشناس",
   "🤝 درخواست‌های ارتباط از کانال",
@@ -47,6 +57,18 @@ const UI_TAP_TEXTS = new Set([
   "📜 قوانین ربات",
   "⚙️ اطلاعات حساب",
   "❓ راهنما"
+,
+  "🎂 سال تولد شمسی",
+  "🗓 ماه تولد",
+  "📍 شهر",
+  "🕌 مذهب",
+  "🕋 فرقه/مذهب",
+  "🎓 رشتهٔ تحصیلی",
+  "🖼 عکس پروفایل مخصوص ربات",
+  "📝 لقب",
+  "📝 دربارهٔ من",
+  "بدون عکس",
+  "↩️ بازگشت به پروفایل"
 ,
   "?? ??? ??????"
 ,
@@ -80,6 +102,24 @@ function channelListText(channels) {
   return channels.map((channel, index) =>
     `${index + 1}. ${channel.chatId}\n${channel.inviteUrl}`
   ).join("\n\n");
+}
+
+function permissionForButton(text) {
+  const permissionByButton = {
+    "🔎 بررسی پیام‌های ناشناس": "moderation",
+    "🗂 آرشیو پیام‌های ناشناس": "message_archive",
+    "📢 درخواست‌های تبلیغات": "ad_requests",
+    "🗃 آرشیو پیام‌های کانال": "channel_archive",
+    "💬 آرشیو چت‌های کاربران": "chat_archive",
+    "🎭 آرشیو ارتباط ناشناس": "anonymous_chat_archive",
+    "📣 پیام همگانی": "broadcast",
+    "📖 ویرایش راهنما و قوانین": "edit_rules",
+    [MEMBERSHIP_BUTTON]: "forced_membership",
+    "⚙️ تنظیمات ربات": "settings",
+    "👥 مدیریت ادمین‌ها": "admin_management"
+  };
+
+  return permissionByButton[text] ?? stage3Permissions[stage3Routes[text]];
 }
 
 function membershipPrompt(channels, verificationError = false) {
@@ -170,8 +210,17 @@ export default {
         if (handled) return Response.json({ ok: true });
       } catch (error) {
         console.error("Callback processing failed:", error);
-        return Response.json({ ok: true });
       }
+      try {
+        await answerCallbackQuery(
+          env,
+          update.callback_query.id,
+          "این گزینه معتبر یا فعال نیست."
+        );
+      } catch (error) {
+        console.error("Could not dismiss invalid callback:", error);
+      }
+      return Response.json({ ok: true });
     }
 
     if (update?.my_chat_member) {
@@ -186,25 +235,10 @@ export default {
     const message = update?.message;
     const from = message?.from;
     const chatId = message?.chat?.id;
-    const text = message?.text?.trim();
+    const text = message?.text?.trim() ?? message?.caption?.trim() ?? "";
+    let menuTapDeleteAttempted = false;
 
-    if (
-      message?.chat?.type === "private" &&
-      message?.message_id &&
-      !/^\/start(?:@\w+)?(?:\s|$)/.test(text ?? "") &&
-      (
-        isUiMenuTap(text) ||
-        /^\/menu(?:@\w+)?(?:\s|$)/.test(text ?? "")
-      )
-    ) {
-      try {
-        await deleteTelegramMessage(env, chatId, message.message_id);
-      } catch (error) {
-        console.error("Could not delete menu tap:", error);
-      }
-    }
-
-    if (!from?.id || !chatId || !text) {
+    if (!from?.id || !chatId || (!text && !hasSupportedMedia(message))) {
       return Response.json({ ok: true });
     }
 
@@ -213,6 +247,8 @@ export default {
       "🏠 منوی اصلی", "⬅️ بازگشت",
       "🛠 پنل مدیریت", "👤 پنل کاربر",
       "👤 پروفایل من", "💌 ثبت پست کراش",
+      "✏️ ویرایش اطلاعات", "❤️ علاقه‌مندی‌های من",
+      "➕ افزودن علاقه‌مندی",
       "🎭 ارتباط ناشناس", "🤝 درخواست‌های ارتباط از کانال",
       "📢 ثبت درخواست تبلیغات", "📖 راهنما و قوانین",
       "🔎 بررسی پیام‌های ناشناس", "🗂 آرشیو پیام‌های ناشناس",
@@ -231,11 +267,20 @@ export default {
 
     if (
       message.chat?.type === "private" &&
-      UI_TAP_TEXTS.has(text) &&
-      message.message_id
+      message.message_id &&
+      !/^\/start(?:@\w+)?(?:\s|$)/.test(message.text?.trim() ?? "") &&
+      (
+        UI_TAP_TEXTS.has(text) ||
+        isUiMenuTap(text) ||
+        /^\/menu(?:@\w+)?(?:\s|$)/.test(text)
+      )
     ) {
-      await clearTrackedSectionMessage(env, chatId);
-      await deleteTelegramMessage(env, chatId, message.message_id);
+      menuTapDeleteAttempted = true;
+      try {
+        await deleteTelegramMessage(env, chatId, message.message_id);
+      } catch (error) {
+        console.error("Could not delete menu tap:", error);
+      }
     }
 
     // Handle normal bot commands and user flows only in private chats.
@@ -245,6 +290,19 @@ export default {
 
     const userId = from.id;
     const isOwner = String(userId) === String(env.OWNER_TELEGRAM_ID);
+    const deleteProcessedInput = async () => {
+      if (
+        !menuTapDeleteAttempted &&
+        message.message_id &&
+        !/^\/start(?:@\w+)?(?:\s|$)/.test(message.text?.trim() ?? "")
+      ) {
+        try {
+          await deleteTelegramMessage(env, chatId, message.message_id);
+        } catch (error) {
+          console.error("Could not delete processed form input:", error);
+        }
+      }
+    };
 
     try {
       await env.CRASH_BOT_DB.prepare(`
@@ -342,10 +400,46 @@ export default {
           return Response.json({ ok: true });
         }
 
+      }
+
+      const workflowHandled = await handleProfileWorkflowMessage(env, message, userId);
+      if (workflowHandled) {
+        await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
+      const requestedPermission = permissionForButton(text);
+      const userWasDeniedManagementRoute =
+        (requestedPermission && !canAccess(role, requestedPermission)) ||
+        text === "↩️ بازگشت به پنل مدیریت" ||
+        text.startsWith("/forced_");
+
+      if (
+        !isStaff &&
+        !userWasDeniedManagementRoute &&
+        !(await isProfileReady(env, userId))
+      ) {
         if (text === VERIFY_BUTTON) {
-          await sendMenu(false);
-          return Response.json({ ok: true });
+          await startProfileFlow(env, chatId, userId);
+        } else {
+          await startProfileFlow(env, chatId, userId);
+          await deleteProcessedInput();
         }
+        return Response.json({ ok: true });
+      }
+
+      if (text === VERIFY_BUTTON) {
+        await sendMenu(false);
+        return Response.json({ ok: true });
+      }
+
+      const profileDestination = stage3Routes[text];
+      const profileRouteHandled = await handleProfileRoute(
+        env, message, userId, profileDestination, text
+      );
+      if (profileRouteHandled) {
+        await deleteProcessedInput();
+        return Response.json({ ok: true });
       }
 
       if (text === "🏠 منوی اصلی" || text === "⬅️ بازگشت") {
@@ -521,21 +615,7 @@ export default {
       ];
 
       if (knownButtons.includes(text)) {
-        const permissionByButton = {
-          "🔎 بررسی پیام‌های ناشناس": "moderation",
-          "🗂 آرشیو پیام‌های ناشناس": "message_archive",
-          "📢 درخواست‌های تبلیغات": "ad_requests",
-          "🗃 آرشیو پیام‌های کانال": "channel_archive",
-          "💬 آرشیو چت‌های کاربران": "chat_archive",
-          "🎭 آرشیو ارتباط ناشناس": "anonymous_chat_archive",
-          "📣 پیام همگانی": "broadcast",
-          "📖 ویرایش راهنما و قوانین": "edit_rules",
-          [MEMBERSHIP_BUTTON]: "forced_membership",
-          "⚙️ تنظیمات ربات": "settings",
-          "👥 مدیریت ادمین‌ها": "admin_management"
-        };
-
-        const requiredPermission = permissionByButton[text] ?? stage3Permissions[stage3Routes[text]];
+        const requiredPermission = permissionForButton(text);
 
         if (requiredPermission && !canAccess(role, requiredPermission)) {
           await sendTelegram(
