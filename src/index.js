@@ -1,4 +1,10 @@
-import { sendTelegram, deleteTelegramMessage, clearTrackedSectionMessage, answerCallbackQuery } from "./telegram/api.js";
+import {
+  sendTelegram,
+  deleteTelegramMessage,
+  clearTrackedSectionMessage,
+  answerCallbackQuery,
+  sendTrackedSectionNoticeTelegram
+} from "./telegram/api.js";
 import { userMenu, adminMenu, sectionMenu, stage3Menu, stage3Routes, stage3ScreenText, stage3ScreenIds, stage3Permissions } from "./telegram/keyboards.js";
 import { getUserRole, canAccess } from "./services/permissions.js";
 import {
@@ -19,6 +25,61 @@ import {
   isProfileReady,
   startProfileFlow
 } from "./services/profile-flow.js";
+import {
+  clearPostConversation,
+  handlePostCallback,
+  handlePostConversation,
+  handlePostHistoryCallback,
+  handleArchiveCallback,
+  listUserPosts,
+  renderPendingQueue,
+  renderPostArchive,
+  resolveDeepLinkToken,
+  setPostConversation
+} from "./services/posts.js";
+import {
+  handleConnectionCallback,
+  handleConnectionMessage,
+  handleStartToken,
+  renderConnections
+} from "./services/connections.js";
+import {
+  handleNotificationCallback,
+  renderNotificationOutbox
+} from "./services/notifications.js";
+import {
+  handleAdminManagementCallback,
+  handleAdminManagementMessage,
+  renderAdminManagement
+} from "./services/admin-management.js";
+import {
+  handleRandomChatCallback,
+  handleRandomChatMessage
+} from "./services/random-chat.js";
+import {
+  handleAdvertisingCallback,
+  handleAdvertisingMessage,
+  openAdvertisingConversation
+} from "./services/advertising-inbox.js";
+import {
+  handleRulesCallback,
+  handleRulesMessage,
+  renderBotRules,
+  startRulesEdit
+} from "./services/rules.js";
+import {
+  getBotEnabledState,
+  handleSettingsCallback,
+  handleSettingsMessage,
+  renderSettings
+} from "./services/settings.js";
+import {
+  handleBroadcastCallback,
+  handleBroadcastMessage,
+  renderBroadcastPanel,
+  startBroadcast
+} from "./services/broadcast.js";
+import { exportManagementWorkbook } from "./services/xlsx-export.js";
 
 const VERIFY_BUTTON = "🔄 بررسی عضویت";
 const MEMBERSHIP_BUTTON = "🔗 عضویت اجباری";
@@ -35,7 +96,10 @@ const UI_TAP_TEXTS = new Set([
   "❤️ علاقه‌مندی‌های من",
   "➕ افزودن علاقه‌مندی",
   "💌 ثبت پست کراش",
+  "✍️ شروع ثبت پست",
+  "📚 ثبت کراش‌های من",
   "🎭 ارتباط ناشناس",
+  "🎭 چت ناشناس تصادفی",
   "🤝 درخواست‌های ارتباط از کانال",
   "📢 ثبت درخواست تبلیغات",
   "📖 راهنما و قوانین",
@@ -43,11 +107,13 @@ const UI_TAP_TEXTS = new Set([
   "🗂 آرشیو پیام‌های ناشناس",
   "📢 درخواست‌های تبلیغات",
   "🗃 آرشیو پیام‌های کانال",
+  "🔔 اعلان‌های نیازمند بررسی",
   "💬 آرشیو چت‌های کاربران",
   "🎭 آرشیو ارتباط ناشناس",
   "📣 پیام همگانی",
   "📖 ویرایش راهنما و قوانین",
   "⚙️ تنظیمات ربات",
+  "📊 خروجی Excel",
   "👥 مدیریت ادمین‌ها",
   "💘 کراش زدن",
   "👻 وصل شدن به ناشناس",
@@ -56,8 +122,7 @@ const UI_TAP_TEXTS = new Set([
   "🏫 خرید ربات برای دانشگاه",
   "📜 قوانین ربات",
   "⚙️ اطلاعات حساب",
-  "❓ راهنما"
-,
+  "❓ راهنما",
   "🎂 سال تولد شمسی",
   "🗓 ماه تولد",
   "📍 شهر",
@@ -110,8 +175,6 @@ function permissionForButton(text) {
     "🗂 آرشیو پیام‌های ناشناس": "message_archive",
     "📢 درخواست‌های تبلیغات": "ad_requests",
     "🗃 آرشیو پیام‌های کانال": "channel_archive",
-    "💬 آرشیو چت‌های کاربران": "chat_archive",
-    "🎭 آرشیو ارتباط ناشناس": "anonymous_chat_archive",
     "📣 پیام همگانی": "broadcast",
     "📖 ویرایش راهنما و قوانین": "edit_rules",
     [MEMBERSHIP_BUTTON]: "forced_membership",
@@ -208,6 +271,39 @@ export default {
           update.callback_query
         );
         if (handled) return Response.json({ ok: true });
+        if (await handleAdvertisingCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleRulesCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleSettingsCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleBroadcastCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handlePostCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handlePostHistoryCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleArchiveCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleAdminManagementCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleRandomChatCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleConnectionCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleNotificationCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
       } catch (error) {
         console.error("Callback processing failed:", error);
       }
@@ -249,13 +345,15 @@ export default {
       "👤 پروفایل من", "💌 ثبت پست کراش",
       "✏️ ویرایش اطلاعات", "❤️ علاقه‌مندی‌های من",
       "➕ افزودن علاقه‌مندی",
-      "🎭 ارتباط ناشناس", "🤝 درخواست‌های ارتباط از کانال",
+      "🎭 ارتباط ناشناس", "🎭 چت ناشناس تصادفی",
+      "🤝 درخواست‌های ارتباط از کانال",
       "📢 ثبت درخواست تبلیغات", "📖 راهنما و قوانین",
       "🔎 بررسی پیام‌های ناشناس", "🗂 آرشیو پیام‌های ناشناس",
       "📢 درخواست‌های تبلیغات", "🗃 آرشیو پیام‌های کانال",
       "💬 آرشیو چت‌های کاربران", "🎭 آرشیو ارتباط ناشناس",
       "📣 پیام همگانی", "📖 ویرایش راهنما و قوانین",
-      "🔗 عضویت اجباری", "⚙️ تنظیمات ربات", "👥 مدیریت ادمین‌ها"
+      "🔗 عضویت اجباری", "⚙️ تنظیمات ربات", "👥 مدیریت ادمین‌ها",
+      "📊 خروجی Excel"
     ];
 
     if (
@@ -357,6 +455,21 @@ export default {
       if (isOwner) {
         const handled = await handleForcedMembershipMessage(env, message);
         if (handled) return Response.json({ ok: true });
+        if (await handleAdminManagementMessage(env, message, userId)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleRulesMessage(env, message, userId, isUiMenuTap(text))) {
+          await deleteProcessedInput();
+          return Response.json({ ok: true });
+        }
+        if (await handleSettingsMessage(env, message, userId, isUiMenuTap(text))) {
+          await deleteProcessedInput();
+          return Response.json({ ok: true });
+        }
+        if (await handleBroadcastMessage(env, message, userId, isUiMenuTap(text))) {
+          await deleteProcessedInput();
+          return Response.json({ ok: true });
+        }
       }
 
       // Staff can manage the bot even when forced membership is enabled.
@@ -402,8 +515,76 @@ export default {
 
       }
 
+      if (!isStaff) {
+        const botState = await getBotEnabledState(env);
+        const allowedWhilePaused =
+          /^\/(?:start|menu)(?:@\w+)?$/.test(text) ||
+          text === VERIFY_BUTTON ||
+          ["📖 راهنما و قوانین", "📜 قوانین ربات", "❓ راهنما"].includes(text);
+        if (!botState.enabled && !allowedWhilePaused) {
+          await sendTelegram(
+            env,
+            chatId,
+            botState.valid
+              ? "⏸ ربات موقتاً غیرفعال است. از /menu، راهنما یا بررسی عضویت استفاده کن."
+              : "⏸ تنظیم وضعیت ربات نامعتبر است؛ دسترسی کاربران موقتاً بسته شده و مالک می‌تواند آن را اصلاح کند.",
+            userMenu(isStaff)
+          );
+          return Response.json({ ok: true });
+        }
+        if (!botState.enabled) {
+          if (["📖 راهنما و قوانین", "📜 قوانین ربات", "❓ راهنما"].includes(text)) {
+            await renderBotRules(env, chatId);
+          } else {
+            await sendMenu(false);
+          }
+          return Response.json({ ok: true });
+        }
+      }
+
+      if (
+        text &&
+        (isUiMenuTap(text) || /^\/(?:start|menu)(?:@\w+)?(?:\s|$)/.test(text))
+      ) {
+        const active = await env.CRASH_BOT_DB.prepare(`
+          SELECT flow_type FROM user_conversations WHERE user_id = ?
+        `).bind(userId).first();
+        if (active) await clearPostConversation(env, userId);
+      }
+
+      const startMatch = /^\/start(?:@\w+)?\s+([a-f0-9]{32})$/.exec(text);
+      if (startMatch) {
+        const target = await resolveDeepLinkToken(env, startMatch[1], userId);
+        if (!target) {
+          await sendTelegram(env, chatId, "این لینک نامعتبر یا منقضی شده است.");
+          return Response.json({ ok: true });
+        }
+        if (!isStaff && !(await isProfileReady(env, userId))) {
+          await env.CRASH_BOT_DB.prepare(`
+            INSERT INTO bot_settings (key, value)
+            VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value
+          `).bind(`pending_start:${userId}`, startMatch[1]).run();
+          const activeWorkflowHandled = await handleProfileWorkflowMessage(
+            env, { ...message, text: "/start", caption: undefined }, userId
+          );
+          if (!activeWorkflowHandled) await startProfileFlow(env, chatId, userId);
+          return Response.json({ ok: true });
+        }
+        await handleStartToken(env, userId, chatId, startMatch[1]);
+        return Response.json({ ok: true });
+      }
+
       const workflowHandled = await handleProfileWorkflowMessage(env, message, userId);
       if (workflowHandled) {
+        const pendingStart = await env.CRASH_BOT_DB.prepare(
+          "SELECT value FROM bot_settings WHERE key = ?"
+        ).bind(`pending_start:${userId}`).first();
+        if (pendingStart?.value && await isProfileReady(env, userId)) {
+          await env.CRASH_BOT_DB.prepare(
+            "DELETE FROM bot_settings WHERE key = ?"
+          ).bind(`pending_start:${userId}`).run();
+          await handleStartToken(env, userId, chatId, pendingStart.value);
+        }
         await deleteProcessedInput();
         return Response.json({ ok: true });
       }
@@ -428,6 +609,33 @@ export default {
         return Response.json({ ok: true });
       }
 
+      if (await handleAdvertisingMessage(
+        env,
+        message,
+        userId,
+        isUiMenuTap(text)
+      )) {
+        await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
+      if (await handleRandomChatMessage(
+        env, message, userId, stage3Routes[text], text
+      )) {
+        await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
+      if (await handlePostConversation(env, message, userId)) {
+        await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
+      if (await handleConnectionMessage(env, message, userId)) {
+        await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
       if (text === VERIFY_BUTTON) {
         await sendMenu(false);
         return Response.json({ ok: true });
@@ -439,6 +647,72 @@ export default {
       );
       if (profileRouteHandled) {
         await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📢 ثبت درخواست تبلیغات") {
+        await openAdvertisingConversation(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📢 درخواست‌های تبلیغات") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "این بخش فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await openAdvertisingConversation(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (
+        ["📖 راهنما و قوانین", "📜 قوانین ربات", "❓ راهنما", "📘 راهنمای ثبت پست"].includes(text)
+      ) {
+        await renderBotRules(env, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📖 ویرایش راهنما و قوانین") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "ویرایش قوانین فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await startRulesEdit(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "⚙️ تنظیمات ربات") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "تنظیمات فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await renderSettings(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📣 پیام همگانی") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "ارسال همگانی فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await renderBroadcastPanel(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📣 شروع پیام همگانی") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "ارسال همگانی فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await startBroadcast(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📊 خروجی Excel") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "خروجی Excel فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await exportManagementWorkbook(env, userId, chatId);
         return Response.json({ ok: true });
       }
 
@@ -459,6 +733,76 @@ export default {
 
       if (text === "👤 پنل کاربر") {
         await sendMenu(false);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "✍️ شروع ثبت پست") {
+        await setPostConversation(env, userId, "post");
+        await sendTelegram(env, chatId, "پیام ناشناس خود را به‌صورت متن یا رسانه بفرست.");
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📨 صف بررسی پیام‌ها" || text === "🔎 بررسی پیام‌های ناشناس") {
+        if (!canAccess(role, "moderation")) {
+          await sendTelegram(
+            env,
+            chatId,
+            "برای دسترسی به این بخش مجوز مدیریت لازم است.",
+            userMenu(isStaff)
+          );
+          return Response.json({ ok: true });
+        }
+        await renderPendingQueue(env, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (
+        text === "🗂 آرشیو پیام‌های ناشناس" ||
+        text === "🗃 آرشیو پیام‌های کانال" ||
+        text === "🗓 آرشیو پیام‌ها"
+      ) {
+        if (!canAccess(role, "message_archive") &&
+            !canAccess(role, "channel_archive")) {
+          await sendTelegram(env, chatId, "برای دسترسی به آرشیو مجوز مدیریت لازم است.");
+          return Response.json({ ok: true });
+        }
+        await renderPostArchive(env, chatId, userId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "🔔 اعلان‌های نیازمند بررسی") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "این بخش فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await renderNotificationOutbox(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "👥 مدیریت ادمین‌ها") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "این بخش فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await renderAdminManagement(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📚 ثبت کراش‌های من") {
+        await listUserPosts(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+
+      if (text === "📥 درخواست‌های دریافتی") {
+        await renderConnections(env, userId, chatId, "incoming");
+        return Response.json({ ok: true });
+      }
+      if (text === "📤 درخواست‌های ارسالی") {
+        await renderConnections(env, userId, chatId, "outgoing");
+        return Response.json({ ok: true });
+      }
+      if (text === "💬 ارتباط‌های فعال") {
+        await renderConnections(env, userId, chatId, "active");
         return Response.json({ ok: true });
       }
 
@@ -604,8 +948,7 @@ export default {
         "🗂 آرشیو پیام‌های ناشناس",
         "📢 درخواست‌های تبلیغات",
         "🗃 آرشیو پیام‌های کانال",
-        "💬 آرشیو چت‌های کاربران",
-        "🎭 آرشیو ارتباط ناشناس",
+        "🔔 اعلان‌های نیازمند بررسی",
         "📣 پیام همگانی",
         "📖 ویرایش راهنما و قوانین",
         MEMBERSHIP_BUTTON,
@@ -674,7 +1017,7 @@ export default {
         await sendTrackedSectionNoticeTelegram(
           env,
           chatId,
-          "این بخش هنوز در حال پیاده‌سازی است. گزینه‌ها به‌ترتیب به قابلیت‌های واقعی متصل خواهند شد.",
+          "این گزینه در نسخهٔ فعلی فعال نیست.",
           sectionMenu(isStaff, Boolean(requiredPermission))
         );
       }

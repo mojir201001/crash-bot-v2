@@ -162,12 +162,11 @@ describe("Crash Bot worker", () => {
     await waitOnExecutionContext(ctx);
 
     expect(response.status).toBe(200);
-    expect(sendSpy).toHaveBeenCalledWith(
+    expect(sendSpy.mock.calls[0].slice(0, 3)).toEqual([
       env,
       87654321,
-      "این بخش فقط برای مالک اصلی در دسترس است.",
-      expect.any(Array)
-    );
+      "این بخش فقط برای مالک اصلی در دسترس است."
+    ]);
   });
 });
 

@@ -21,9 +21,9 @@ describe("Telegram menus", () => {
 
     expect(buttons).toContain("🔎 بررسی پیام‌های ناشناس");
     expect(buttons).toContain("🗂 آرشیو پیام‌های ناشناس");
-    expect(buttons).toContain("📢 درخواست‌های تبلیغات");
     expect(buttons).toContain("👤 پنل کاربر");
 
+    expect(buttons).not.toContain("📢 درخواست‌های تبلیغات");
     expect(buttons).not.toContain("👥 مدیریت ادمین‌ها");
     expect(buttons).not.toContain("📣 پیام همگانی");
     expect(buttons).not.toContain("⚙️ تنظیمات ربات");
@@ -33,8 +33,10 @@ describe("Telegram menus", () => {
     const buttons = buttonTexts(adminMenu(true));
 
     expect(buttons).toContain("👥 مدیریت ادمین‌ها");
+    expect(buttons).toContain("📢 درخواست‌های تبلیغات");
     expect(buttons).toContain("📣 پیام همگانی");
     expect(buttons).toContain("⚙️ تنظیمات ربات");
     expect(buttons).toContain("🗃 آرشیو پیام‌های کانال");
+    expect(buttons).not.toContain("💬 آرشیو چت‌های کاربران");
   });
 });

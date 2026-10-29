@@ -32,6 +32,123 @@ async function telegramRequest(env, method, payload) {
   return result;
 }
 
+async function telegramRequestDetailed(env, method, payload) {
+  let response;
+  try {
+    response = await fetch(
+      `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }
+    );
+  } catch (error) {
+    return { outcome: "unknown", error };
+  }
+
+  let result;
+  try {
+    result = await response.json();
+  } catch (error) {
+    return { outcome: "unknown", error };
+  }
+  if (!response.ok || result?.ok !== true) {
+    return {
+      outcome: response.status >= 500 ? "unknown" : "rejected",
+      description: result?.description
+    };
+  }
+  return { outcome: "sent", result: result.result };
+}
+
+export async function sendMediaTelegram(env, method, payload) {
+  const result = await telegramRequestDetailed(env, method, payload);
+  if (result.outcome !== "sent") {
+    const error = new Error(result.description ?? `Telegram ${method} failed`);
+    error.telegramOutcome = result.outcome;
+    error.telegramDefiniteFailure = result.outcome === "rejected";
+    throw error;
+  }
+  return result.result;
+}
+
+export async function sendMediaTelegramDetailed(env, method, payload) {
+  const result = await telegramRequestDetailed(env, method, payload);
+  if (result.outcome !== "sent") {
+    return { outcome: result.outcome };
+  }
+  const messageId = result.result?.message_id;
+  return Number.isSafeInteger(messageId)
+    ? { outcome: "sent", messageId, result: result.result }
+    : { outcome: "unknown" };
+}
+
+export async function sendDocumentBytesDetailed(env, chatId, filename, bytes) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append(
+    "document",
+    new Blob([bytes], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    }),
+    filename
+  );
+
+  let response;
+  try {
+    response = await fetch(
+      `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`,
+      { method: "POST", body: form }
+    );
+  } catch {
+    return { outcome: "unknown" };
+  }
+  let result;
+  try {
+    result = await response.json();
+  } catch {
+    return { outcome: "unknown" };
+  }
+  if (!response.ok || result?.ok !== true) {
+    return { outcome: response.status >= 500 ? "unknown" : "rejected" };
+  }
+  return Number.isSafeInteger(result.result?.message_id)
+    ? { outcome: "sent", messageId: result.result.message_id }
+    : { outcome: "unknown" };
+}
+
+export async function sendMessageTelegramDetailed(env, chatId, text, keyboard = null) {
+  const result = await telegramRequestDetailed(env, "sendMessage", {
+    chat_id: chatId,
+    text,
+    ...(Array.isArray(keyboard) ? {
+      reply_markup: keyboard.length
+        ? { keyboard, resize_keyboard: true, is_persistent: false }
+        : { remove_keyboard: true }
+    } : {})
+  });
+  if (result.outcome !== "sent") return { outcome: result.outcome };
+  return Number.isSafeInteger(result.result?.message_id)
+    ? { outcome: "sent", messageId: result.result.message_id }
+    : { outcome: "unknown" };
+}
+
+export async function sendInlineTelegramDetailed(
+  env, chatId, text, inlineKeyboard, parseMode = null
+) {
+  const result = await telegramRequestDetailed(env, "sendMessage", {
+    chat_id: chatId,
+    text,
+    ...(parseMode ? { parse_mode: parseMode } : {}),
+    reply_markup: { inline_keyboard: inlineKeyboard }
+  });
+  if (result.outcome !== "sent") return { outcome: result.outcome };
+  return Number.isSafeInteger(result.result?.message_id)
+    ? { outcome: "sent", messageId: result.result.message_id }
+    : { outcome: "unknown" };
+}
+
 /*
  * Reply keyboards must not be tied to an automatic
  * delete-old-screen workflow. Deleting a bot message
@@ -105,10 +222,11 @@ export async function sendTelegram(env, chatId, text, keyboard) {
   return true;
 }
 
-export async function sendInlineTelegram(env, chatId, text, inlineKeyboard) {
+export async function sendInlineTelegram(env, chatId, text, inlineKeyboard, parseMode = null) {
   const result = await telegramRequest(env, "sendMessage", {
     chat_id: chatId,
     text,
+    ...(parseMode ? { parse_mode: parseMode } : {}),
     reply_markup: {
       inline_keyboard: inlineKeyboard
     }
