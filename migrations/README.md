@@ -81,9 +81,12 @@ target database and migration ledger.
 
 Migration `0012_random_chat_and_ad_inbox.sql` adds independent random-chat
 membership, webhook deduplication, rate limits, delivery status, and private
-advertising inbox tables. The inbox is a user-to-owner conversation only; it
-does not implement pricing, payment, ad publication, or the legacy `ads`
-workflow. It preserves existing tables and data.
+advertising inbox tables. The `anonymous_sessions.updated_at` column uses a
+constant default, backfills existing rows, and uses an insert trigger to set
+timestamps for new sessions. SQLite does not permit `DEFAULT CURRENT_TIMESTAMP`
+directly in `ALTER TABLE ADD COLUMN`. The inbox is a user-to-owner conversation
+only; it does not implement pricing, payment, ad publication, or the legacy
+`ads` workflow. It preserves existing tables and data.
 
 Migration `0013_rules_and_broadcast.sql` adds the read marker and rules
 version history plus persistent broadcast campaigns and per-recipient

@@ -1,5 +1,18 @@
 ALTER TABLE anonymous_sessions ADD COLUMN ended_reason TEXT;
-ALTER TABLE anonymous_sessions ADD COLUMN updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP;
+-- SQLite requires a constant default when adding a column.
+ALTER TABLE anonymous_sessions ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+UPDATE anonymous_sessions
+SET updated_at = CURRENT_TIMESTAMP
+WHERE updated_at = '';
+
+CREATE TRIGGER anonymous_sessions_set_updated_at
+AFTER INSERT ON anonymous_sessions
+WHEN NEW.updated_at = ''
+BEGIN
+  UPDATE anonymous_sessions
+  SET updated_at = CURRENT_TIMESTAMP
+  WHERE id = NEW.id;
+END;
 ALTER TABLE anonymous_sessions ADD COLUMN notice_a_status TEXT NOT NULL DEFAULT 'pending'
   CHECK (notice_a_status IN ('pending', 'sending', 'sent', 'failed', 'unknown'));
 ALTER TABLE anonymous_sessions ADD COLUMN notice_b_status TEXT NOT NULL DEFAULT 'pending'

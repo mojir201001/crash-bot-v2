@@ -105,6 +105,23 @@ afterEach(async () => {
 });
 
 describe("random anonymous chat", () => {
+  it("sets updated_at for newly inserted anonymous sessions", async () => {
+    const user = await createUser("man");
+    const inserted = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO anonymous_sessions (user_a_id, requested_gender, status)
+      VALUES (?, 'woman', 'waiting')
+      RETURNING id
+    `).bind(user).first();
+
+    fixtureSessions.add(inserted.id);
+    const session = await env.CRASH_BOT_DB.prepare(
+      "SELECT updated_at FROM anonymous_sessions WHERE id = ?"
+    ).bind(inserted.id).first();
+
+    expect(typeof session.updated_at).toBe("string");
+    expect(session.updated_at.length).toBeGreaterThan(0);
+  });
+
   it("matches two users only when both stored preferences are compatible", async () => {
     const man = await createUser("man");
     const woman = await createUser("woman");
