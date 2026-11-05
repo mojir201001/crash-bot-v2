@@ -25,13 +25,16 @@ async function createUser(id = null, admin = false) {
   return userId;
 }
 
-async function createPost(userId, createdAt, content) {
+async function createPost(userId, createdAt, content, status = "rejected") {
   const row = await env.CRASH_BOT_DB.prepare(`
-    INSERT INTO posts (user_id, content, created_at)
-    VALUES (?, ?, ?) RETURNING id
-  `).bind(userId, content, createdAt).first();
+    INSERT INTO posts (user_id, content, created_at, status)
+    VALUES (?, ?, ?, ?) RETURNING id
+  `).bind(userId, content, createdAt, status).first();
   fixturePosts.add(row.id);
-  return row.id;
+  const post = await env.CRASH_BOT_DB.prepare(
+    "SELECT user_record_number FROM posts WHERE id = ?"
+  ).bind(row.id).first();
+  return post.user_record_number;
 }
 
 function callback(actorId, data) {
@@ -100,14 +103,14 @@ describe("Persian archive calendar and active archive route", () => {
     const first = await createPost(owner, range.start, "at start");
     const last = await createPost(owner, endMinusSecond, "before end");
     await createPost(owner, range.end, "at next month");
-    const send = vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    const edit = vi.spyOn(telegramApi, "editInlineTelegram").mockResolvedValue(true);
     vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
 
     await handleArchiveCallback(env, callback(
       owner, "archive:month:1404:12:0"
     ));
 
-    const screen = send.mock.calls.at(-1)[2];
+    const screen = edit.mock.calls.at(-1)[3];
     expect(screen).toContain("#" + first);
     expect(screen).toContain("#" + last);
     expect(screen).not.toContain("at next month");
@@ -120,18 +123,33 @@ describe("Persian archive calendar and active archive route", () => {
     for (let index = 0; index < 11; index += 1) {
       await createPost(owner, range.start, `entry ${index}`);
     }
-    const send = vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    const edit = vi.spyOn(telegramApi, "editInlineTelegram").mockResolvedValue(true);
     vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
 
     await handleArchiveCallback(env, callback(owner, "archive:month:1405:1:0"));
-    expect(send.mock.calls.at(-1)[2]).toContain("11 مورد");
-    expect(send.mock.calls.at(-1)[3].flat().some((button) =>
+    expect(edit.mock.calls.at(-1)[3]).toContain("11 مورد");
+    expect(edit.mock.calls.at(-1)[4].flat().some((button) =>
       button.callback_data === "archive:month:1405:1:1"
     )).toBe(true);
 
     await handleArchiveCallback(env, callback(owner, "archive:month:1405:2:0"));
-    expect(send.mock.calls.at(-1)[2]).toContain("0 مورد");
-    expect(send.mock.calls.at(-1)[2]).toContain("در این بازه پیامی ثبت نشده است");
+    expect(edit.mock.calls.at(-1)[3]).toContain("0 مورد");
+    expect(edit.mock.calls.at(-1)[3]).toContain("در این بازه پیامی ثبت نشده است");
+    expect(edit.mock.calls.every((call) => call[2] === 100)).toBe(true);
+  });
+
+  it("keeps pending moderation items out of the management archive", async () => {
+    const owner = await createUser(Number(env.OWNER_TELEGRAM_ID));
+    const final = await createPost(owner, "2026-03-01 12:00:00", "final record");
+    await createPost(owner, "2026-03-02 12:00:00", "pending moderation", "pending");
+    const edit = vi.spyOn(telegramApi, "editInlineTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+
+    await handleArchiveCallback(env, callback(owner, "archive:all:0"));
+
+    expect(edit.mock.calls.at(-1)[3]).toContain(`#${final}`);
+    expect(edit.mock.calls.at(-1)[3]).not.toContain("pending moderation");
+    expect(edit.mock.calls.at(-1)[3]).toContain("1 مورد");
   });
 
   it("enforces server-side role checks and rejects stale invalid periods", async () => {

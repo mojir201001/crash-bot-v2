@@ -1,8 +1,9 @@
 ﻿export function userMenu(isStaff) {
   const keyboard = [
     [{ text: "👤 پروفایل من" }, { text: "💌 ثبت پست کراش" }],
-    [{ text: "🎭 چت ناشناس تصادفی" }, { text: "🤝 درخواست‌های ارتباط از کانال" }],
+    [{ text: "🎭 ارتباط ناشناس" }, { text: "🤝 درخواست‌های ارتباط از کانال" }],
     [{ text: "📚 ثبت کراش‌های من" }],
+    [{ text: "🔔 اعلان‌ها" }],
     [{ text: "📢 ثبت درخواست تبلیغات" }, { text: "📖 راهنما و قوانین" }]
   ];
   if (isStaff) keyboard.push([{ text: "🛠 پنل مدیریت" }]);
@@ -20,6 +21,8 @@ export function adminMenu(isOwner) {
     keyboard.splice(2, 0,
       [{ text: "📢 درخواست‌های تبلیغات" }],
       [{ text: "🗃 آرشیو پیام‌های کانال" }],
+      [{ text: "🎭 آرشیو چت‌های ناشناس" }],
+      [{ text: "🤝 آرشیو ارتباط‌های کانال" }],
       [{ text: "🔔 اعلان‌های نیازمند بررسی" }],
       [{ text: "📣 پیام همگانی" }],
       [{ text: "📖 ویرایش راهنما و قوانین" }],
@@ -48,8 +51,12 @@ export const stage3Routes = {
   // Main user menu
   "👤 پروفایل من": "profile",
   "💌 ثبت پست کراش": "crush_post",
-  "🎭 چت ناشناس تصادفی": "anonymous",
+  "🎭 چت ناشناس تصادفی": "anonymous_random",
   "🎭 ارتباط ناشناس": "anonymous",
+  "🎲 چت ناشناس تصادفی": "anonymous_random",
+  "🔗 لینک اختصاصی چت": "anonymous_link",
+  "🔎 ارتباط با آیدی": "anonymous_username",
+  "🔔 اعلان‌ها": "anonymous_inbox",
   "🤝 درخواست‌های ارتباط از کانال": "connections",
   "📢 ثبت درخواست تبلیغات": "advertise",
   "📖 راهنما و قوانین": "help",
@@ -58,6 +65,8 @@ export const stage3Routes = {
   "🔎 بررسی پیام‌های ناشناس": "moderation",
   "🗂 آرشیو پیام‌های ناشناس": "message_archive",
   "📢 درخواست‌های تبلیغات": "ad_requests",
+  "🎭 آرشیو چت‌های ناشناس": "owner_anonymous_archive",
+  "🤝 آرشیو ارتباط‌های کانال": "owner_channel_chat_archive",
   "📣 پیام همگانی": "broadcast",
   "📖 ویرایش راهنما و قوانین": "edit_rules",
   "⚙️ تنظیمات ربات": "settings",
@@ -123,6 +132,8 @@ export const stage3Routes = {
 export const stage3Permissions = {
   moderation: "moderation",
   message_archive: "message_archive",
+  owner_anonymous_archive: "owner_anonymous_archive",
+  owner_channel_chat_archive: "owner_channel_chat_archive",
   ad_requests: "ad_requests",
   broadcast: "broadcast",
   edit_rules: "edit_rules",
@@ -184,6 +195,15 @@ const screens = {
   },
 
   anonymous: {
+    text: "🎭 ارتباط ناشناس\n\nیکی از روش‌های چت ناشناس را انتخاب کن.",
+    rows: [
+      [{ text: "🎲 چت ناشناس تصادفی" }],
+      [{ text: "🔗 لینک اختصاصی چت" }, { text: "🔎 ارتباط با آیدی" }],
+      [{ text: "🔔 اعلان‌ها" }]
+    ],
+    back: "↩️ بازگشت به منوی کاربر"
+  },
+  anonymous_random: {
     text: "🎭 چت ناشناس تصادفی\n\nاین گفت‌وگو از ارتباط‌های پذیرفته‌شده جداست.",
     rows: [[{ text: "🔍 پیدا کردن فرد" }]],
     back: "↩️ بازگشت به منوی کاربر"
@@ -238,6 +258,16 @@ const screens = {
     rows: [],
     back: "↩️ بازگشت به پنل مدیریت"
   },
+  owner_anonymous_archive: {
+    text: "🎭 آرشیو گفت‌وگوهای دوطرفهٔ ناشناس؛ فقط‌خواندنی و مخصوص مالک اصلی.",
+    rows: [],
+    back: "↩️ بازگشت به پنل مدیریت"
+  },
+  owner_channel_chat_archive: {
+    text: "🤝 آرشیو ارتباط‌های پذیرفته‌شده از پست‌های کانال؛ فقط‌خواندنی و مخصوص مالک اصلی.",
+    rows: [],
+    back: "↩️ بازگشت به پنل مدیریت"
+  },
 
   ad_requests: {
     text: "📢 درخواست‌های تبلیغات\n\nفقط مالک اصلی می‌تواند فهرست درخواست‌دهندگان و مکالمه‌های خصوصی را مشاهده کند.",
@@ -275,6 +305,7 @@ export const stage3ScreenIds = Object.keys(screens);
 
 const adminScreens = new Set([
   "moderation", "message_archive", "ad_requests",
+  "owner_anonymous_archive", "owner_channel_chat_archive",
   "broadcast", "edit_rules", "settings", "excel_export",
   "admin_management"
 ]);

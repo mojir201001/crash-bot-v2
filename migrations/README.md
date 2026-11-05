@@ -99,12 +99,90 @@ does not provide an idempotency key. The same migration is applied by the
 local D1 test harness during `npx vitest run`; do not apply it remotely as
 part of development.
 
+Migration `0014_anonymous_inbox_and_archives.sql` adds persistent anonymous
+conversations, per-message inbox notifications, delivery/view state, and
+indexes for the owner-only conversation archives. It tracks only Telegram
+message IDs used to render the current archive page so that page navigation
+can remove those display copies without touching stored history. It links new personal-link
+and username messages to their conversation and removes the legacy
+connection-message outbox trigger so new connection messages use the same
+per-message inbox flow as other anonymous chats. Existing messages and outbox
+rows are preserved; historical messages are not backfilled into the new inbox
+because old delivery/view state cannot be inferred. The local D1 test harness
+applies this migration during `npx vitest run`; do not apply it remotely as
+part of development.
+
+Migration `0015_per_user_post_numbers.sql` adds a per-sender record number to
+each post/reply, backfills existing records in creation order, and seeds an
+atomic counter for later inserts. The internal post ID remains the stable
+identifier for callbacks and foreign keys; user-facing history and moderation
+screens show the per-sender number. The unique `(user_id, user_record_number)`
+index prevents duplicate numbers. If `0015` is partially applied but absent
+from the migration ledger, do not rerun it or repair the ledger manually;
+inspect the affected table, counter and trigger definitions, then restore a
+consistent pre-migration backup/Time Travel point before applying the complete
+migration through Wrangler. The local D1 test harness applies this migration;
+it has not been applied to the remote database as part of development.
+
 The management post archive and Excel export use `Asia/Tehran` for date
-presentation. Excel export is owner-only and includes at most 500 newest
-posts/replies, with post text capped at 2,000 characters per row. It excludes
-Telegram user IDs, usernames, credentials, and environment values; cells are
-written as text and formula-like input is escaped. No spreadsheet is retained
-after it is sent.
+presentation. Excel export is owner-only and reads every post/reply by a
+stable `(created_at, id)` cursor, with at most 1,000 rows materialized per
+workbook and at most ten workbooks processed per Worker invocation. Larger
+exports continue through an owner-only persisted callback; these are per-batch
+working sizes, not a total-record ceiling. Post text remains capped at 2,000
+characters per row, and columns, order, values, and formatting are preserved.
+It includes the sender's numeric Telegram ID and username as stored when the
+post/reply was submitted; credentials and environment values are excluded.
+Cells are written as text and formula-like input is escaped. Each completed
+part is tracked by its Telegram message reference; prior output messages are
+deleted only after the replacement export has been completely delivered.
+
+Migration `0016_conversation_replies_and_blocks.sql` adds the stored reply
+target for anonymous messages, Telegram message IDs for inbox alerts,
+conversation-scoped blocks, per-actor reply contexts and active conversation
+selections, and tracking for temporary history display messages. It preserves
+existing message and inbox rows. It is forward-only and must follow migrations
+`0014` and `0015`; the local D1 test harness applies it during `npx vitest run`.
+It has not been applied remotely as part of development. If it is partially
+applied but missing from a database's migration ledger, do not rerun it or edit
+the ledger manually. Inspect the ledger and affected table definitions, then
+restore a consistent pre-migration backup/Time Travel point before applying
+the complete sequence through Wrangler.
+
+Migration `0017_blocked_message_review.sql` stores messages sent into a
+conversation blocked by the recipient without exposing their content. The
+recipient receives a private review action; only after choosing to unblock and
+view is the message moved into the normal anonymous history and marked viewed.
+This keeps block enforcement scoped to the existing conversation and preserves
+the message for idempotent review. The local D1 test harness applies this
+migration; it has not been applied remotely.
+
+Migration `0018_advertising_chat_controls.sql` adds per-conversation advertising
+blocks, per-message reply references, and a visibility state for messages held
+until the recipient explicitly unblocks and views them. Messages previously
+recorded as delivered are marked as already displayed; uncertain and failed
+deliveries remain pending for an explicit view action. Existing message content
+is preserved. The local D1 test harness applies this migration; do not apply it
+remotely as part of development.
+
+Migration `0019_anonymous_sender_echo.sql` tracks the sender-side display copy
+independently from delivery to the recipient. Existing records are marked as
+already displayed so applying the migration never replays historical messages.
+New messages can therefore be echoed to their sender with controls while
+duplicate webhook updates remain idempotent. It also stores references to the
+owner-delivered Excel files and export progress. Data is read and sent in
+bounded per-invocation chunks; old document messages are deleted only after
+the replacement is complete. It also stores cursor state for owner-triggered
+text archive exports and source Telegram message IDs for Excel requests, so
+webhook redelivery cannot start the same export twice.
+The local D1 test harness applies this migration; do not apply it remotely as
+part of development.
+
+Migration `0020_telegram_last_name.sql` adds the current Telegram last name to
+the user identity record. Webhook updates refresh username and Telegram name
+fields while the numeric Telegram ID remains the stable identity key. This
+migration is local/test-only in this work and must not be applied remotely
+without explicit approval.
 
 Persistent `bot_settings` values may contain operational settings such as
 `bot_enabled`, `bot_rules_text`, and non-secret channel configuration. Bot
@@ -113,7 +191,7 @@ never rendered in the settings panel. When `bot_enabled` is `0` or invalid,
 ordinary users retain only `/start`, `/menu`, help/rules, and membership
 verification; owner and staff access remains available for recovery.
 
-If `0012` or `0013` is unrecorded but partly applied in an environment, do not
+If a migration is unrecorded but partly applied in an environment, do not
 rerun it or alter `d1_migrations`. Inspect the ledger and affected table
 definitions, then restore a consistent pre-migration backup/Time Travel point
 before applying the complete sequence with Wrangler. If the ledger and schema

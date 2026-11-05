@@ -48,6 +48,18 @@ import {
   renderNotificationOutbox
 } from "./services/notifications.js";
 import {
+  clearOwnerArchiveDisplay,
+  CHAT_RETURN_BUTTON,
+  handleAnonymousChatCallback,
+  handleAnonymousConversationMessage,
+  handlePersonalLinkStart,
+  renderAnonymousHome,
+  renderOwnerAnonymousArchive,
+  renderOwnerConnectionArchive,
+  renderPersonalLink,
+  renderUserMessageInbox
+} from "./services/anonymous-chat.js";
+import {
   handleAdminManagementCallback,
   handleAdminManagementMessage,
   renderAdminManagement
@@ -61,6 +73,7 @@ import {
   handleAdvertisingMessage,
   openAdvertisingConversation
 } from "./services/advertising-inbox.js";
+import { upsertTelegramUser } from "./services/telegram-users.js";
 import {
   handleRulesCallback,
   handleRulesMessage,
@@ -79,7 +92,10 @@ import {
   renderBroadcastPanel,
   startBroadcast
 } from "./services/broadcast.js";
-import { exportManagementWorkbook } from "./services/xlsx-export.js";
+import {
+  exportManagementWorkbook,
+  handleExportWorkbookCallback
+} from "./services/xlsx-export.js";
 
 const VERIFY_BUTTON = "🔄 بررسی عضویت";
 const MEMBERSHIP_BUTTON = "🔗 عضویت اجباری";
@@ -87,6 +103,7 @@ const MEMBERSHIP_BUTTON = "🔗 عضویت اجباری";
 const UI_TAP_TEXTS = new Set([
   "/menu",
   "🏠 منوی اصلی",
+  CHAT_RETURN_BUTTON,
   "⬅️ بازگشت",
   "🛠 پنل مدیریت",
   "👤 پنل کاربر",
@@ -99,6 +116,11 @@ const UI_TAP_TEXTS = new Set([
   "✍️ شروع ثبت پست",
   "📚 ثبت کراش‌های من",
   "🎭 ارتباط ناشناس",
+  "🔗 لینک اختصاصی چت",
+  "🔎 ارتباط با آیدی",
+  "🔔 اعلان‌ها",
+  "🎭 آرشیو چت‌های ناشناس",
+  "🤝 آرشیو ارتباط‌های کانال",
   "🎭 چت ناشناس تصادفی",
   "🤝 درخواست‌های ارتباط از کانال",
   "📢 ثبت درخواست تبلیغات",
@@ -175,6 +197,8 @@ function permissionForButton(text) {
     "🗂 آرشیو پیام‌های ناشناس": "message_archive",
     "📢 درخواست‌های تبلیغات": "ad_requests",
     "🗃 آرشیو پیام‌های کانال": "channel_archive",
+    "🎭 آرشیو چت‌های ناشناس": "owner_anonymous_archive",
+    "🤝 آرشیو ارتباط‌های کانال": "owner_channel_chat_archive",
     "📣 پیام همگانی": "broadcast",
     "📖 ویرایش راهنما و قوانین": "edit_rules",
     [MEMBERSHIP_BUTTON]: "forced_membership",
@@ -266,6 +290,15 @@ export default {
 
     if (update?.callback_query) {
       try {
+        const callbackUser = update.callback_query.from;
+        const callbackChat = update.callback_query.message?.chat;
+        if (
+          Number.isSafeInteger(callbackUser?.id) &&
+          callbackChat?.type === "private" &&
+          String(callbackChat.id) === String(callbackUser.id)
+        ) {
+          await upsertTelegramUser(env, callbackUser);
+        }
         const handled = await handleForcedMembershipCallback(
           env,
           update.callback_query
@@ -281,6 +314,9 @@ export default {
           return Response.json({ ok: true });
         }
         if (await handleBroadcastCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleExportWorkbookCallback(env, update.callback_query)) {
           return Response.json({ ok: true });
         }
         if (await handlePostCallback(env, update.callback_query)) {
@@ -302,6 +338,9 @@ export default {
           return Response.json({ ok: true });
         }
         if (await handleNotificationCallback(env, update.callback_query)) {
+          return Response.json({ ok: true });
+        }
+        if (await handleAnonymousChatCallback(env, update.callback_query)) {
           return Response.json({ ok: true });
         }
       } catch (error) {
@@ -334,7 +373,8 @@ export default {
     const text = message?.text?.trim() ?? message?.caption?.trim() ?? "";
     let menuTapDeleteAttempted = false;
 
-    if (!from?.id || !chatId || (!text && !hasSupportedMedia(message))) {
+    if (!Number.isSafeInteger(from?.id) || !chatId ||
+        (!text && !hasSupportedMedia(message))) {
       return Response.json({ ok: true });
     }
 
@@ -346,6 +386,8 @@ export default {
       "✏️ ویرایش اطلاعات", "❤️ علاقه‌مندی‌های من",
       "➕ افزودن علاقه‌مندی",
       "🎭 ارتباط ناشناس", "🎭 چت ناشناس تصادفی",
+      "🔗 لینک اختصاصی چت", "🔎 ارتباط با آیدی", "🔔 اعلان‌ها",
+      "🎭 آرشیو چت‌های ناشناس", "🤝 آرشیو ارتباط‌های کانال",
       "🤝 درخواست‌های ارتباط از کانال",
       "📢 ثبت درخواست تبلیغات", "📖 راهنما و قوانین",
       "🔎 بررسی پیام‌های ناشناس", "🗂 آرشیو پیام‌های ناشناس",
@@ -360,6 +402,13 @@ export default {
       message.chat?.type === "private" &&
       (sectionNavigationTexts.includes(text) || isUiMenuTap(text))
     ) {
+      if (String(from.id) === String(env.OWNER_TELEGRAM_ID)) {
+        try {
+          await clearOwnerArchiveDisplay(env, from.id);
+        } catch (error) {
+          console.error("Could not clear previous owner archive messages:", error);
+        }
+      }
       await clearTrackedSectionMessage(env, chatId);
     }
 
@@ -403,17 +452,7 @@ export default {
     };
 
     try {
-      await env.CRASH_BOT_DB.prepare(`
-        INSERT INTO users (telegram_id, username, first_name)
-        VALUES (?, ?, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET
-          username = excluded.username,
-          first_name = excluded.first_name
-      `).bind(
-        userId,
-        from.username ?? null,
-        from.first_name ?? null
-      ).run();
+      await upsertTelegramUser(env, from);
 
       const userResult = await env.CRASH_BOT_DB.prepare(`
         SELECT is_blocked, account_status
@@ -552,9 +591,12 @@ export default {
         if (active) await clearPostConversation(env, userId);
       }
 
-      const startMatch = /^\/start(?:@\w+)?\s+([a-f0-9]{32})$/.exec(text);
+      const startMatch = /^\/start(?:@\w+)?\s+([A-Za-z0-9_-]{16,64})$/.exec(text);
       if (startMatch) {
-        const target = await resolveDeepLinkToken(env, startMatch[1], userId);
+        const isPersonalLink = /^anon_[a-f0-9]{32}$/.test(startMatch[1]);
+        const target = isPersonalLink
+          ? { type: "anonymous_link" }
+          : await resolveDeepLinkToken(env, startMatch[1], userId);
         if (!target) {
           await sendTelegram(env, chatId, "این لینک نامعتبر یا منقضی شده است.");
           return Response.json({ ok: true });
@@ -570,7 +612,11 @@ export default {
           if (!activeWorkflowHandled) await startProfileFlow(env, chatId, userId);
           return Response.json({ ok: true });
         }
-        await handleStartToken(env, userId, chatId, startMatch[1]);
+        if (isPersonalLink) {
+          await handlePersonalLinkStart(env, userId, chatId, startMatch[1]);
+        } else {
+          await handleStartToken(env, userId, chatId, startMatch[1]);
+        }
         return Response.json({ ok: true });
       }
 
@@ -583,8 +629,22 @@ export default {
           await env.CRASH_BOT_DB.prepare(
             "DELETE FROM bot_settings WHERE key = ?"
           ).bind(`pending_start:${userId}`).run();
-          await handleStartToken(env, userId, chatId, pendingStart.value);
+          if (/^anon_[a-f0-9]{32}$/.test(pendingStart.value)) {
+            await handlePersonalLinkStart(env, userId, chatId, pendingStart.value);
+          } else {
+            await handleStartToken(env, userId, chatId, pendingStart.value);
+          }
         }
+        await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
+      if (
+        !isStaff &&
+        ["🏠 منوی اصلی", "⬅️ بازگشت", CHAT_RETURN_BUTTON].includes(text) &&
+        !(await isProfileReady(env, userId))
+      ) {
+        await sendMenu(false);
         await deleteProcessedInput();
         return Response.json({ ok: true });
       }
@@ -609,20 +669,68 @@ export default {
         return Response.json({ ok: true });
       }
 
+      if (await handleAnonymousConversationMessage(env, message, userId)) {
+        return Response.json({ ok: true });
+      }
+
       if (await handleAdvertisingMessage(
         env,
         message,
         userId,
         isUiMenuTap(text)
       )) {
-        await deleteProcessedInput();
         return Response.json({ ok: true });
       }
 
       if (await handleRandomChatMessage(
         env, message, userId, stage3Routes[text], text
       )) {
-        await deleteProcessedInput();
+        return Response.json({ ok: true });
+      }
+
+      const anonymousDestination = stage3Routes[text];
+      if (anonymousDestination === "anonymous") {
+        await renderAnonymousHome(env, chatId);
+        return Response.json({ ok: true });
+      }
+      if (anonymousDestination === "anonymous_random") {
+        await handleRandomChatMessage(env, message, userId, anonymousDestination, text);
+        return Response.json({ ok: true });
+      }
+      if (anonymousDestination === "anonymous_link") {
+        await renderPersonalLink(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+      if (anonymousDestination === "anonymous_username") {
+        await env.CRASH_BOT_DB.prepare(`
+          INSERT INTO anonymous_chat_states (user_id, state, updated_at)
+          VALUES (?, 'username_lookup', CURRENT_TIMESTAMP)
+          ON CONFLICT(user_id) DO UPDATE SET
+            state = 'username_lookup', target_user_id = NULL,
+            conversation_id = NULL, updated_at = CURRENT_TIMESTAMP
+        `).bind(userId).run();
+        await sendTelegram(env, chatId,
+          "آیدی عمومی تلگرام را با قالب @username بفرست. پیام به کاربری می‌رسد که قبلاً ربات را شروع کرده باشد.");
+        return Response.json({ ok: true });
+      }
+      if (anonymousDestination === "anonymous_inbox") {
+        await renderUserMessageInbox(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+      if (anonymousDestination === "owner_anonymous_archive") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "این آرشیو فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await renderOwnerAnonymousArchive(env, userId, chatId);
+        return Response.json({ ok: true });
+      }
+      if (anonymousDestination === "owner_channel_chat_archive") {
+        if (role !== "owner") {
+          await sendTelegram(env, chatId, "این آرشیو فقط برای مالک اصلی در دسترس است.");
+          return Response.json({ ok: true });
+        }
+        await renderOwnerConnectionArchive(env, userId, chatId);
         return Response.json({ ok: true });
       }
 
@@ -632,7 +740,6 @@ export default {
       }
 
       if (await handleConnectionMessage(env, message, userId)) {
-        await deleteProcessedInput();
         return Response.json({ ok: true });
       }
 
@@ -712,11 +819,12 @@ export default {
           await sendTelegram(env, chatId, "خروجی Excel فقط برای مالک اصلی در دسترس است.");
           return Response.json({ ok: true });
         }
-        await exportManagementWorkbook(env, userId, chatId);
+        await exportManagementWorkbook(env, userId, chatId, message.message_id);
         return Response.json({ ok: true });
       }
 
-      if (text === "🏠 منوی اصلی" || text === "⬅️ بازگشت") {
+      if (text === "🏠 منوی اصلی" || text === "⬅️ بازگشت" ||
+          text === CHAT_RETURN_BUTTON) {
         await sendMenu(false);
         return Response.json({ ok: true });
       }

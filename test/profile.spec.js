@@ -22,8 +22,10 @@ import {
 import {
   handleProfileWorkflowMessage,
   handleProfileRoute,
+  isProfileReady,
   startProfileFlow
 } from "../src/services/profile-flow.js";
+import { userMenu } from "../src/telegram/keyboards.js";
 
 const fixtureUsers = new Set();
 const fixtureSettings = new Set();
@@ -137,11 +139,42 @@ describe("Profile and interest persistence", () => {
     expect(profile.birth_year).toBeTruthy();
   });
 
+  it("displays the stored profile photo and interest media", async () => {
+    const userId = await createUser();
+    await saveCompleteProfile(userId);
+    await saveProfileField(env, userId, "image_file_id", "profile-photo-id");
+    await saveInterest(env, userId, {
+      category: "هنر",
+      content: "عکس هنری",
+      mediaType: "photo",
+      mediaFileId: "interest-photo-id",
+      caption: "اثر هنری"
+    });
+    vi.spyOn(telegramApi, "sendTrackedSectionNoticeTelegram").mockResolvedValue(true);
+    const mediaSpy = vi.spyOn(telegramApi, "sendMediaTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 1 });
+
+    await startProfileFlow(env, userId, userId);
+    await handleProfileRoute(env, { chat: { id: userId } }, userId, "interests");
+
+    expect(mediaSpy).toHaveBeenCalledWith(env, "sendPhoto", expect.objectContaining({
+      chat_id: userId,
+      photo: "profile-photo-id"
+    }));
+    expect(mediaSpy).toHaveBeenCalledWith(env, "sendPhoto", expect.objectContaining({
+      chat_id: userId,
+      photo: "interest-photo-id",
+      caption: expect.stringContaining("اثر هنری")
+    }));
+  });
+
   it("shows a Persian month keyboard and does not render the birth year", async () => {
     const userId = await createUser();
     await saveCompleteProfile(userId);
     const screenSpy = vi.spyOn(telegramApi, "sendTrackedSectionNoticeTelegram")
       .mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendMediaTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 1 });
 
     await startProfileFlow(env, userId, userId);
     const profileText = screenSpy.mock.calls.at(-1)[2];
@@ -152,7 +185,29 @@ describe("Profile and interest persistence", () => {
       chat: { id: userId }
     }, userId, "field_birth_month", "🗓 ماه تولد");
     const monthKeyboard = screenSpy.mock.calls.at(-1)[3];
-    expect(monthKeyboard.flat().map((button) => button.text)).toEqual(PERSIAN_MONTHS);
+    expect(monthKeyboard.flat().map((button) => button.text)
+      .filter((text) => PERSIAN_MONTHS.includes(text))).toEqual(PERSIAN_MONTHS);
+    expect(monthKeyboard.flat().map((button) => button.text))
+      .toContain("🏠 منوی اصلی");
+  });
+
+  it("keeps home and profile-editor navigation available on edit forms", async () => {
+    const userId = await createUser();
+    await saveCompleteProfile(userId);
+    const screenSpy = vi.spyOn(telegramApi, "sendTrackedSectionNoticeTelegram")
+      .mockResolvedValue(true);
+
+    await handleProfileRoute(env, { chat: { id: userId } }, userId, "profile_edit");
+    expect(screenSpy.mock.calls.at(-1)[3].flat().map((button) => button.text))
+      .toContain("🏠 منوی اصلی");
+
+    await handleProfileRoute(env, { chat: { id: userId } }, userId, "field_bio");
+    expect(screenSpy.mock.calls.at(-1)[3].flat().map((button) => button.text))
+      .toEqual(["↩️ بازگشت به ویرایش اطلاعات", "🏠 منوی اصلی"]);
+
+    await handleProfileRoute(env, { chat: { id: userId } }, userId, "field_image");
+    expect(screenSpy.mock.calls.at(-1)[3].flat().map((button) => button.text))
+      .toEqual(["بدون عکس", "↩️ بازگشت به پروفایل", "🏠 منوی اصلی"]);
   });
 
   it("stores dynamic text/media interests and restricts deletion to the owner", async () => {
@@ -265,7 +320,7 @@ describe("Profile and interest persistence", () => {
     }, userId);
     expect(screenSpy.mock.calls.at(-1)[2]).toContain("آیا اسموکینگ داری؟");
     expect(screenSpy.mock.calls.at(-1)[3].flat().map((button) => button.text))
-      .toEqual(["بله", "خیر", "↩️ بازگشت به پروفایل"]);
+      .toEqual(["بله", "خیر", "↩️ بازگشت به پروفایل", "🏠 منوی اصلی"]);
 
     await handleProfileWorkflowMessage(env, {
       chat: { id: userId }, text: "بله"
@@ -279,7 +334,7 @@ describe("Profile and interest persistence", () => {
 });
 
 describe("Webhook profile gate and message cleanup", () => {
-  it("removes an obsolete reply keyboard when a form expects free text", async () => {
+  it("preserves, replaces, and removes reply keyboards without deleting prior screens", async () => {
     const chatId = 800000000 + Math.floor(Math.random() * 100000000);
     const settingKey = `ui_section_message:${chatId}`;
     fixtureSettings.add(settingKey);
@@ -288,13 +343,48 @@ describe("Webhook profile gate and message cleanup", () => {
       calls.push({ url: String(url), body: JSON.parse(init.body) });
       return {
         ok: true,
-        json: async () => ({ ok: true, result: { message_id: 700 } })
+        json: async () => ({ ok: true, result: { message_id: 700 + calls.length } })
       };
     }));
 
-    await telegramApi.sendTrackedSectionNoticeTelegram(env, chatId, "متن آزاد", []);
-    const body = calls.find(({ url }) => url.endsWith("/sendMessage")).body;
-    expect(body.reply_markup).toEqual({ remove_keyboard: true });
+    const keyboard = [[{ text: "🏠 منوی اصلی" }]];
+    await telegramApi.sendTrackedSectionNoticeTelegram(env, chatId, "صفحهٔ منو", keyboard);
+    await telegramApi.sendTrackedSectionNoticeTelegram(env, chatId, "متن آزاد");
+    await telegramApi.sendTrackedSectionNoticeTelegram(env, chatId, "حذف صریح", []);
+
+    expect(calls.map(({ body }) => body.reply_markup)).toEqual([
+      { keyboard, resize_keyboard: true, is_persistent: false },
+      undefined,
+      { remove_keyboard: true }
+    ]);
+    expect(calls.some(({ url }) => url.endsWith("/deleteMessage"))).toBe(false);
+  });
+
+  it("clears tracked inline screens without deleting the reply-keyboard screen", async () => {
+    const chatId = 800000000 + Math.floor(Math.random() * 100000000);
+    const replyKey = `ui_section_message:${chatId}`;
+    const inlineKey = `ui_inline_section_message:${chatId}`;
+    fixtureSettings.add(replyKey);
+    fixtureSettings.add(inlineKey);
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO bot_settings (key, value) VALUES (?, ?), (?, ?)
+    `).bind(replyKey, "701", inlineKey, "702").run();
+
+    const calls = [];
+    vi.stubGlobal("fetch", vi.fn(async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) });
+      return {
+        ok: true,
+        json: async () => ({ ok: true, result: true })
+      };
+    }));
+
+    await telegramApi.clearTrackedSectionMessage(env, chatId);
+
+    expect(calls.map(({ body }) => body.message_id)).toEqual([702]);
+    await expect(env.CRASH_BOT_DB.prepare(
+      "SELECT value FROM bot_settings WHERE key = ?"
+    ).bind(replyKey).first()).resolves.toEqual({ value: "701" });
   });
 
   it("requires profile completion after membership and preserves /start", async () => {
@@ -339,6 +429,73 @@ describe("Webhook profile gate and message cleanup", () => {
       stage: "field",
       payload: { field: "nickname", onboarding: true }
     });
+  });
+
+  it("allows an incomplete user to return to the menu without bypassing the profile gate", async () => {
+    const userId = await createUser();
+    fixtureSettings.add(`ui_section_message:${userId}`);
+    fixtureSettings.add(`ui_main_screen_message:${userId}`);
+    const telegramCalls = [];
+    vi.stubGlobal("fetch", vi.fn(async (url, init) => {
+      telegramCalls.push({ url: String(url), body: JSON.parse(init.body) });
+      return {
+        ok: true,
+        json: async () => ({ ok: true, result: { message_id: telegramCalls.length } })
+      };
+    }));
+
+    await startProfileFlow(env, userId, userId);
+    const request = new Request("https://example.test/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": env.WEBHOOK_SECRET
+      },
+      body: JSON.stringify({
+        update_id: userId,
+        message: {
+          message_id: 93,
+          from: { id: userId, first_name: "Incomplete" },
+          chat: { id: userId, type: "private" },
+          text: "🏠 منوی اصلی"
+        }
+      })
+    });
+
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(request, env, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    expect(await isProfileReady(env, userId)).toBe(false);
+    const menuCall = telegramCalls.find(({ body }) =>
+      body.text?.includes("به کراش‌یاب ادیب خوش اومدی")
+    );
+    expect(menuCall.body.reply_markup.keyboard).toEqual(userMenu(false));
+
+    const featureRequest = new Request("https://example.test/webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": env.WEBHOOK_SECRET
+      },
+      body: JSON.stringify({
+        update_id: userId + 1,
+        message: {
+          message_id: 94,
+          from: { id: userId, first_name: "Incomplete" },
+          chat: { id: userId, type: "private" },
+          text: "💌 ثبت پست کراش"
+        }
+      })
+    });
+    const featureCtx = createExecutionContext();
+    const featureResponse = await worker.fetch(featureRequest, env, featureCtx);
+    await waitOnExecutionContext(featureCtx);
+    expect(featureResponse.status).toBe(200);
+    expect(telegramCalls.some(({ body }) =>
+      body.text?.includes("تکمیل پروفایل")
+    )).toBe(true);
   });
 
   it("routes media-only webhook updates through an active interest form and deletes the input", async () => {

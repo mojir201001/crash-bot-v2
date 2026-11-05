@@ -14,7 +14,7 @@
 
 export function canAccess(role, permission) {
   const permissions = {
-    owner: ["admin_panel", "moderation", "message_archive", "ad_requests", "channel_archive", "broadcast", "edit_rules", "forced_membership", "settings", "admin_management", "excel_export"],
+    owner: ["admin_panel", "moderation", "message_archive", "ad_requests", "channel_archive", "owner_anonymous_archive", "owner_channel_chat_archive", "broadcast", "edit_rules", "forced_membership", "settings", "admin_management", "excel_export"],
     admin: ["admin_panel", "moderation", "message_archive"],
     user: []
   };

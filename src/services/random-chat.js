@@ -2,11 +2,20 @@ import {
   answerCallbackQuery,
   sendInlineTelegram,
   sendInlineTelegramDetailed,
-  sendMediaTelegramDetailed,
   sendMessageTelegramDetailed,
   sendTelegram
 } from "../telegram/api.js";
 import { getProfile, isProfileComplete } from "./profile.js";
+import { conversationMediaFromMessage } from "./conversation-engine.js";
+import {
+  appendAndNotify,
+  clearConversationReplyContext,
+  clearConversationSelection,
+  CHAT_RETURN_BUTTON,
+  CHAT_RETURN_KEYBOARD,
+  getConversationSelection,
+  selectConversation
+} from "./anonymous-chat.js";
 
 const SEARCH_LIMIT = 5;
 const MESSAGE_LIMIT = 10;
@@ -15,23 +24,15 @@ const MESSAGE_WINDOW_MINUTES = 1;
 const WAITING_SESSION_MINUTES = 30;
 const navigationTexts = new Set([
   "/start", "/menu", "🏠 منوی اصلی", "⬅️ بازگشت",
+  CHAT_RETURN_BUTTON,
   "👤 پنل کاربر", "🛠 پنل مدیریت",
   "🎭 ارتباط ناشناس", "🎭 چت ناشناس تصادفی",
+  "🔗 لینک اختصاصی چت", "🔎 ارتباط با آیدی", "🔔 اعلان‌ها",
   "👤 پروفایل من", "💌 ثبت پست کراش", "🤝 درخواست‌های ارتباط از کانال",
   "📚 ثبت کراش‌های من", "📢 ثبت درخواست تبلیغات", "📖 راهنما و قوانین"
 ]);
-const mediaTypes = [
-  "photo", "video", "document", "audio", "voice",
-  "animation", "video_note", "sticker"
-];
-
 function mediaFromMessage(message) {
-  for (const type of mediaTypes) {
-    const value = message?.[type];
-    const item = Array.isArray(value) ? value.at(-1) : value;
-    if (item?.file_id) return { type, fileId: item.file_id };
-  }
-  return null;
+  return conversationMediaFromMessage(message);
 }
 
 async function expireWaitingSessions(env) {
@@ -94,6 +95,10 @@ async function sendSessionNotice(env, session, participantRole) {
     WHERE id = ? AND ${statusColumn} = 'sending'
   `).bind(result.outcome === "rejected" ? "failed" : result.outcome,
     session.id).run();
+  await sendMessageTelegramDetailed(
+    env, userId, "برای خروج از گفت‌وگو از دکمهٔ بازگشت استفاده کن.",
+    CHAT_RETURN_KEYBOARD
+  );
 }
 
 async function showSessionStatus(env, chatId, session) {
@@ -103,6 +108,10 @@ async function showSessionStatus(env, chatId, session) {
       chatId,
       "🔎 در صف جست‌وجوی ناشناس هستی. اگر تا ۳۰ دقیقه جفتی پیدا نشود، صف منقضی می‌شود.",
       statusKeyboard(session)
+    );
+    await sendMessageTelegramDetailed(
+      env, chatId, "برای خروج از صف از دکمهٔ بازگشت استفاده کن.",
+      CHAT_RETURN_KEYBOARD
     );
     return;
   }
@@ -118,6 +127,7 @@ export async function renderRandomChatHome(env, userId, chatId) {
   await expireWaitingSessions(env);
   const session = await currentSession(env, userId);
   if (session) {
+    await selectConversation(env, userId, "random_chat", session.id);
     await showSessionStatus(env, chatId, session);
     return;
   }
@@ -162,7 +172,10 @@ async function recordSearch(env, message, userId, requestedGender) {
   await expireWaitingSessions(env);
 
   const existing = await currentSession(env, userId);
-  if (existing) return { status: existing.status, session: existing };
+  if (existing) {
+    await selectConversation(env, userId, "random_chat", existing.id);
+    return { status: existing.status, session: existing };
+  }
 
   try {
     const results = await env.CRASH_BOT_DB.batch([
@@ -256,9 +269,14 @@ async function recordSearch(env, message, userId, requestedGender) {
     }
     const current = await currentSession(env, userId);
     if (Number(results[2]?.meta?.changes ?? 0) > 0 && current?.status === "active") {
+      await Promise.all([
+        selectConversation(env, current.user_a_id, "random_chat", current.id),
+        selectConversation(env, current.user_b_id, "random_chat", current.id)
+      ]);
       return { status: "matched", session: current };
     }
     if (Number(results[4]?.meta?.changes ?? 0) > 0 && current?.status === "waiting") {
+      await selectConversation(env, userId, "random_chat", current.id);
       return { status: "waiting", session: current };
     }
     const action = await env.CRASH_BOT_DB.prepare(`
@@ -315,31 +333,6 @@ export async function joinRandomChat(env, message, userId, requestedGender) {
   return true;
 }
 
-async function deliverRandomMessage(env, row, message) {
-  const media = mediaFromMessage(message);
-  if (!media) {
-    return sendMessageTelegramDetailed(env, row.recipient_id, row.message);
-  }
-  const methods = {
-    photo: "sendPhoto",
-    video: "sendVideo",
-    document: "sendDocument",
-    audio: "sendAudio",
-    voice: "sendVoice",
-    animation: "sendAnimation",
-    video_note: "sendVideoNote",
-    sticker: "sendSticker"
-  };
-  const field = media.type === "photo" ? "photo" : media.type;
-  return sendMediaTelegramDetailed(env, methods[media.type], {
-    chat_id: row.recipient_id,
-    [field]: media.fileId,
-    ...(!["sticker", "video_note"].includes(media.type) && message.caption
-      ? { caption: message.caption }
-      : {})
-  });
-}
-
 async function relayRandomMessage(env, message, userId, session) {
   if (!Number.isSafeInteger(message?.message_id) || message.message_id <= 0) {
     await sendTelegram(env, message.chat.id, "شناسهٔ پیام معتبر نیست و پیام ثبت نشد.");
@@ -351,93 +344,58 @@ async function relayRandomMessage(env, message, userId, session) {
     await sendTelegram(env, message.chat.id, "پیام متنی یا رسانهٔ پشتیبانی‌شده بفرست.");
     return true;
   }
-  const rate = await env.CRASH_BOT_DB.batch([
-    env.CRASH_BOT_DB.prepare(`
-      INSERT INTO random_chat_rate_limits
-        (user_id, action_type, window_started_at, action_count)
-      SELECT ?, 'message', CURRENT_TIMESTAMP, 1
-      WHERE NOT EXISTS (
-        SELECT 1 FROM anonymous_messages
-        WHERE sender_id = ? AND source_message_id = ? AND message_type = 'random_chat'
-      )
-      ON CONFLICT(user_id, action_type) DO UPDATE SET
-        action_count = CASE
-          WHEN window_started_at <= datetime('now', '-${MESSAGE_WINDOW_MINUTES} minutes')
-            THEN 1
-          ELSE action_count + 1
-        END,
-        window_started_at = CASE
-          WHEN window_started_at <= datetime('now', '-${MESSAGE_WINDOW_MINUTES} minutes')
-            THEN CURRENT_TIMESTAMP
-          ELSE window_started_at
-        END
-      RETURNING action_count
-    `).bind(userId, userId, message.message_id),
-    env.CRASH_BOT_DB.prepare(`
-      INSERT INTO anonymous_messages (
-        sender_id, recipient_id, message, message_type, session_id,
-        media_type, media_file_id, caption, source_message_id, delivery_status
-      )
-      SELECT ?, ?, ?, 'random_chat', ?, ?, ?, ?, ?, 'sending'
-      WHERE EXISTS (
-        SELECT 1 FROM anonymous_sessions s
-        JOIN anonymous_chat_members m ON m.session_id = s.id
-        WHERE s.id = ? AND s.status = 'active' AND m.user_id = ?
-          AND (s.user_a_id = ? OR s.user_b_id = ?)
-      )
-        AND (SELECT action_count FROM random_chat_rate_limits
-          WHERE user_id = ? AND action_type = 'message') <= ${MESSAGE_LIMIT}
-      ON CONFLICT(sender_id, source_message_id)
-        WHERE message_type = 'random_chat' AND source_message_id IS NOT NULL
-      DO NOTHING
-      RETURNING id, recipient_id, message
-    `).bind(userId, session.user_a_id === userId ? session.user_b_id : session.user_a_id,
-      content, session.id, media?.type ?? null, media?.fileId ?? null,
-      message.caption ?? null, message.message_id, session.id, userId,
-      userId, userId, userId)
-  ]);
-  const actionCount = Number(rate[0]?.results?.[0]?.action_count ?? 0);
-  const inserted = rate[1]?.results?.[0];
-  if (!inserted) {
-    const duplicate = await env.CRASH_BOT_DB.prepare(`
-      SELECT id, delivery_status FROM anonymous_messages
+  const rate = await env.CRASH_BOT_DB.prepare(`
+    INSERT INTO random_chat_rate_limits
+      (user_id, action_type, window_started_at, action_count)
+    SELECT ?, 'message', CURRENT_TIMESTAMP, 1
+    WHERE NOT EXISTS (
+      SELECT 1 FROM anonymous_messages
       WHERE sender_id = ? AND source_message_id = ? AND message_type = 'random_chat'
-    `).bind(userId, message.message_id).first();
-    if (duplicate) {
-      if (duplicate.delivery_status === "sending") {
-        await sendTelegram(env, message.chat.id,
-          "وضعیت تحویل پیام قبلی نامشخص است؛ برای جلوگیری از تکرار، دوباره ارسال نشده.");
-      }
-      return true;
-    }
-    await sendTelegram(env, message.chat.id, actionCount > MESSAGE_LIMIT
-      ? "تعداد پیام‌ها زیاد است؛ یک دقیقه بعد دوباره تلاش کن."
-      : "گفت‌وگو دیگر فعال نیست و پیام ارسال نشد.");
+    )
+    ON CONFLICT(user_id, action_type) DO UPDATE SET
+      action_count = CASE
+        WHEN window_started_at <= datetime('now', '-${MESSAGE_WINDOW_MINUTES} minutes')
+          THEN 1
+        ELSE action_count + 1
+      END,
+      window_started_at = CASE
+        WHEN window_started_at <= datetime('now', '-${MESSAGE_WINDOW_MINUTES} minutes')
+          THEN CURRENT_TIMESTAMP
+        ELSE window_started_at
+      END
+    RETURNING action_count
+  `).bind(userId, userId, message.message_id).first();
+  const actionCount = Number(rate?.action_count ?? 0);
+  if (actionCount > MESSAGE_LIMIT) {
+    await sendTelegram(env, message.chat.id, "تعداد پیام‌ها زیاد است؛ یک دقیقه بعد دوباره تلاش کن.");
     return true;
   }
 
-  const delivery = await deliverRandomMessage(env, inserted, message);
-  const deliveryStatus = delivery.outcome === "rejected" ? "failed" : delivery.outcome;
-  await env.CRASH_BOT_DB.prepare(`
-    UPDATE anonymous_messages SET delivery_status = ?, delivery_error = ?
-    WHERE id = ? AND delivery_status = 'sending'
-  `).bind(deliveryStatus, delivery.outcome === "sent"
-    ? null
-    : delivery.outcome === "unknown"
-      ? "Telegram delivery outcome is unknown"
-      : "Telegram rejected the message", inserted.id).run();
-  await sendTelegram(env, message.chat.id,
-    deliveryStatus === "sent"
-      ? "پیام به گفت‌وگوی ناشناس ارسال شد."
-      : deliveryStatus === "unknown"
-        ? "نتیجهٔ تحویل نامشخص است؛ پیام را دوباره نفرست."
-        : "پیام به طرف گفت‌وگو تحویل نشد.");
+  const recipientId = String(session.user_a_id) === String(userId)
+    ? session.user_b_id : session.user_a_id;
+  const result = await appendAndNotify(env, {
+    senderId: userId,
+    recipientId,
+    sourceType: "random_chat",
+    sessionId: session.id,
+    message,
+    sourceMessageId: message.message_id
+  });
+  if (["blocked", "inactive"].includes(result.status)) {
+    await sendTelegram(env, message.chat.id,
+      result.status === "blocked"
+        ? "این گفت‌وگو مسدود شده است."
+        : "گفت‌وگو دیگر فعال نیست و پیام ارسال نشد.");
+  } else if (result.status === "invalid") {
+    await sendTelegram(env, message.chat.id, "پیام متنی یا رسانهٔ پشتیبانی‌شده بفرست.");
+  }
   return true;
 }
 
 export async function handleRandomChatMessage(env, message, userId, destination, text) {
   const randomDestinations = [
-    "anonymous", "anonymous_gender", "anonymous_queue_girl", "anonymous_queue_boy"
+    "anonymous", "anonymous_random", "anonymous_gender",
+    "anonymous_queue_girl", "anonymous_queue_boy"
   ];
   const isRandomRoute = randomDestinations.includes(destination);
   if (isRandomRoute) {
@@ -474,16 +432,42 @@ export async function handleRandomChatMessage(env, message, userId, destination,
   if (destination && !isRandomRoute) {
     const session = await currentSession(env, userId);
     if (session) {
+      if (session.status === "waiting") {
+        await finishRandomSession(env, userId, session.id, "cancel");
+        return false;
+      }
       await sendInlineTelegram(env, message.chat.id,
         "برای جلوگیری از تداخل گفت‌وگوها، ابتدا چت ناشناس را پایان بده یا جست‌وجو را لغو کن.",
         statusKeyboard(session));
       return true;
     }
   }
-  if (navigationTexts.has(text)) return false;
+  if (navigationTexts.has(text)) {
+    if (text === CHAT_RETURN_BUTTON) {
+      const active = await currentSession(env, userId);
+      if (active) {
+        const action = active.status === "waiting" ? "cancel" : "end";
+        const ended = await finishRandomSession(env, userId, active.id, action);
+        if (ended?.peerId) {
+          await sendTelegram(env, ended.peerId,
+            "طرف گفت‌وگو چت ناشناس را پایان داد.",
+            [[{ text: "🎭 ارتباط ناشناس" }], [{ text: "🏠 منوی اصلی" }]]);
+        }
+      }
+    }
+    return false;
+  }
 
   let session = await currentSession(env, userId);
   if (!session) return false;
+  const selection = await getConversationSelection(env, userId);
+  if (selection && (
+    selection.conversation_type !== "random_chat" ||
+    Number(selection.conversation_id) !== Number(session.id)
+  )) return false;
+  if (!selection) {
+    await selectConversation(env, userId, "random_chat", session.id);
+  }
   if (session.status === "waiting" &&
       new Date(`${session.created_at.replace(" ", "T")}Z`).getTime() <=
         Date.now() - WAITING_SESSION_MINUTES * 60000) {
@@ -509,20 +493,7 @@ export async function handleRandomChatMessage(env, message, userId, destination,
   return relayRandomMessage(env, message, userId, session);
 }
 
-export async function handleRandomChatCallback(env, query) {
-  const match = /^random:(cancel|end):(\d+)$/.exec(query?.data ?? "");
-  if (!match) return false;
-  const [, action, rawId] = match;
-  const actorId = query.from?.id;
-  const chatId = query.message?.chat?.id;
-  const sessionId = Number(rawId);
-  if (query.message?.chat?.type !== "private" ||
-      !actorId || String(actorId) !== String(chatId) ||
-      !Number.isSafeInteger(sessionId) || sessionId <= 0) {
-    await answerCallbackQuery(env, query.id, "این عملیات فقط در گفت‌وگوی خصوصی خودت معتبر است.");
-    return true;
-  }
-
+async function finishRandomSession(env, actorId, sessionId, action) {
   const expectedStatus = action === "cancel" ? "waiting" : "active";
   const results = await env.CRASH_BOT_DB.batch([
     env.CRASH_BOT_DB.prepare(`
@@ -541,24 +512,53 @@ export async function handleRandomChatCallback(env, query) {
     `).bind(sessionId)
   ]);
   const updated = results[0]?.results?.[0];
-  if (!updated) {
+  if (!updated) return null;
+  await env.CRASH_BOT_DB.prepare(
+    "DELETE FROM anonymous_chat_members WHERE session_id = ?"
+  ).bind(sessionId).run();
+  const reference = { type: "random_chat", id: sessionId };
+  await Promise.all([updated.user_a_id, updated.user_b_id]
+    .filter(Boolean)
+    .flatMap((participantId) => [
+      clearConversationSelection(env, participantId, reference),
+      clearConversationReplyContext(env, participantId, reference)
+    ]));
+  return {
+    peerId: !updated.user_b_id
+      ? null
+      : String(updated.user_a_id) === String(actorId)
+        ? updated.user_b_id
+        : updated.user_a_id
+  };
+}
+
+export async function handleRandomChatCallback(env, query) {
+  const match = /^random:(cancel|end):(\d+)$/.exec(query?.data ?? "");
+  if (!match) return false;
+  const [, action, rawId] = match;
+  const actorId = query.from?.id;
+  const chatId = query.message?.chat?.id;
+  const sessionId = Number(rawId);
+  if (query.message?.chat?.type !== "private" ||
+      !actorId || String(actorId) !== String(chatId) ||
+      !Number.isSafeInteger(sessionId) || sessionId <= 0) {
+    await answerCallbackQuery(env, query.id, "این عملیات فقط در گفت‌وگوی خصوصی خودت معتبر است.");
+    return true;
+  }
+
+  const ended = await finishRandomSession(env, actorId, sessionId, action);
+  if (!ended) {
     await answerCallbackQuery(env, query.id,
       "این دکمه مربوط به جست‌وجو یا گفت‌وگوی فعالی نیست.");
     return true;
   }
-  await env.CRASH_BOT_DB.prepare(
-    "DELETE FROM anonymous_chat_members WHERE session_id = ?"
-  ).bind(sessionId).run();
   await answerCallbackQuery(env, query.id,
     action === "cancel" ? "جست‌وجو لغو شد." : "گفت‌وگو پایان یافت.");
-  const peerId = String(updated.user_a_id) === String(actorId)
-    ? updated.user_b_id
-    : updated.user_a_id;
   await sendTelegram(env, chatId,
     action === "cancel" ? "جست‌وجو لغو شد." : "گفت‌وگوی ناشناس پایان یافت.",
     [[{ text: "🎭 ارتباط ناشناس" }], [{ text: "🏠 منوی اصلی" }]]);
-  if (action === "end" && peerId) {
-    await sendTelegram(env, peerId, "طرف گفت‌وگو چت ناشناس را پایان داد.",
+  if (action === "end" && ended.peerId) {
+    await sendTelegram(env, ended.peerId, "طرف گفت‌وگو چت ناشناس را پایان داد.",
       [[{ text: "🎭 ارتباط ناشناس" }], [{ text: "🏠 منوی اصلی" }]]);
   }
   return true;

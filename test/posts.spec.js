@@ -5,6 +5,9 @@ import {
   createDeepLinkToken,
   handleArchiveCallback,
   handlePostCallback,
+  handlePostHistoryCallback,
+  listUserPosts,
+  notifyModerators,
   renderPostArchive,
   resolveDeepLinkToken,
   submitPost
@@ -127,6 +130,7 @@ describe("post submission and shared queue", () => {
       text: "  original <text>  ",
       from: { username: undefined }
     });
+
     const mediaPost = await createPost(sender, {
       message_id: 112,
       photo: [{ file_id: "small" }, { file_id: "largest" }],
@@ -163,6 +167,20 @@ describe("post submission and shared queue", () => {
     ]);
   });
 
+  it("stores the numeric Telegram sender ID and submission-time username", async () => {
+    const sender = await createUser();
+    const submitted = await submitPost(
+      env,
+      { id: sender, username: "submission_name" },
+      { message_id: 113, text: "submission identity" }
+    );
+    const row = await env.CRASH_BOT_DB.prepare(`
+      SELECT user_id, sender_username FROM posts WHERE id = ?
+    `).bind(submitted.id).first();
+
+    expect(row).toEqual({ user_id: sender, sender_username: "submission_name" });
+  });
+
   it("associates replies with a published parent and deduplicates a retried Telegram message", async () => {
     const sender = await createUser("actual_username");
     const parentId = await createPost(sender);
@@ -197,6 +215,161 @@ describe("post submission and shared queue", () => {
 });
 
 describe("atomic moderation and publishing", () => {
+  it("restores moderation and owner actions after canceling confirmation", async () => {
+    const owner = Number(env.OWNER_TELEGRAM_ID);
+    await createUser(null, owner);
+    const sender = await createUser();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO profiles (user_id, nickname) VALUES (?, 'لقب ویژه')
+    `).bind(sender).run();
+    const post = await submitPost(
+      env, { id: sender, username: "moderated_name" },
+      { message_id: 3001, text: "متن اصلی" }
+    );
+    const queue = await env.CRASH_BOT_DB.prepare(
+      "SELECT id FROM admin_queue WHERE item_id = ?"
+    ).bind(post.id).first();
+    const edit = vi.spyOn(telegramApi, "editInlineTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+
+    await handlePostCallback(env, callback(owner, `post:review:${queue.id}:rejected`));
+    await handlePostCallback(env, callback(owner, `post:cancel:${queue.id}`));
+    expect(edit.mock.calls.at(-1)[4].flat().map((button) => button.callback_data))
+      .toEqual([
+        `post:review:${queue.id}:approved`,
+        `post:review:${queue.id}:rejected`
+      ]);
+    expect(edit.mock.calls.at(-1)[3]).toContain("متن اصلی");
+    expect(edit.mock.calls.at(-1)[3]).toContain("شماره رکورد فرستنده: 1");
+    expect(edit.mock.calls.at(-1)[3]).toContain(String(sender));
+    expect(edit.mock.calls.at(-1)[3]).toContain("@moderated_name");
+    expect(edit.mock.calls.at(-1)[3]).toContain("لقب ویژه");
+    const pending = await env.CRASH_BOT_DB.prepare(`
+      SELECT q.status AS queue_status, p.status AS post_status
+      FROM admin_queue q JOIN posts p ON p.id = q.item_id
+      WHERE q.id = ?
+    `).bind(queue.id).first();
+    expect(pending).toEqual({ queue_status: "pending", post_status: "pending" });
+
+    const admin = await createUser();
+    await env.CRASH_BOT_DB.prepare("INSERT INTO admin_roles (user_id) VALUES (?)")
+      .bind(admin).run();
+    const adminPost = await submitPost(
+      env, { id: sender, username: "moderated_name" },
+      { message_id: 3003, text: "متن باقی‌مانده برای مدیر" }
+    );
+    const adminQueue = await env.CRASH_BOT_DB.prepare(
+      "SELECT id FROM admin_queue WHERE item_id = ?"
+    ).bind(adminPost.id).first();
+    await handlePostCallback(env, callback(
+      admin, `post:review:${adminQueue.id}:approved`
+    ));
+    await handlePostCallback(env, callback(admin, `post:cancel:${adminQueue.id}`));
+    const adminRestoredText = edit.mock.calls.at(-1)[3];
+    expect(adminRestoredText).toContain("متن باقی‌مانده برای مدیر");
+    expect(adminRestoredText).toContain("شماره رکورد فرستنده: 2");
+    expect(adminRestoredText).not.toContain(String(sender));
+    expect(adminRestoredText).not.toContain("@moderated_name");
+    const adminPending = await env.CRASH_BOT_DB.prepare(`
+      SELECT q.status AS queue_status, p.status AS post_status
+      FROM admin_queue q JOIN posts p ON p.id = q.item_id
+      WHERE q.id = ?
+    `).bind(adminQueue.id).first();
+    expect(adminPending).toEqual({ queue_status: "pending", post_status: "pending" });
+
+    await env.CRASH_BOT_DB.prepare(
+      "UPDATE posts SET status = 'rejected' WHERE id = ?"
+    ).bind(post.id).run();
+    await handlePostCallback(env, callback(owner, `post:repost:${post.id}`));
+    await handlePostCallback(env, callback(owner, `post:cancel:${post.id}`));
+    expect(edit.mock.calls.at(-1)[4].flat().map((button) => button.callback_data))
+      .toContain(`post:repost:${post.id}`);
+
+    await env.CRASH_BOT_DB.prepare(
+      "UPDATE posts SET status = 'approved' WHERE id = ?"
+    ).bind(post.id).run();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO publication_jobs (item_type, item_id, status, attempts)
+      VALUES ('post', ?, 'unknown', 1)
+    `).bind(post.id).run();
+    await handlePostCallback(env, callback(owner, `post:recover:${post.id}`));
+    await handlePostCallback(env, callback(owner, `post:cancel:${post.id}`));
+    expect(edit.mock.calls.at(-1)[4].flat().map((button) => button.callback_data))
+      .toContain(`post:recover:${post.id}`);
+  });
+
+  it("numbers post records independently per sender, including concurrent submissions", async () => {
+    const senderA = await createUser();
+    const senderB = await createUser();
+    const initial = await Promise.all([
+      createPost(senderA, { message_id: 1001, text: "A1" }),
+      createPost(senderA, { message_id: 1002, text: "A2" }),
+      createPost(senderB, { message_id: 2001, text: "B1" }),
+      createPost(senderB, { message_id: 2002, text: "B2" })
+    ]);
+    const concurrent = await Promise.all([
+      createPost(senderA, { message_id: 1003, text: "A3" }),
+      createPost(senderA, { message_id: 1004, text: "A4" })
+    ]);
+    const rows = await env.CRASH_BOT_DB.prepare(`
+      SELECT user_id, user_record_number
+      FROM posts WHERE user_id IN (?, ?)
+      ORDER BY user_id, user_record_number
+    `).bind(senderA, senderB).all();
+    const bySender = new Map();
+    for (const row of rows.results) {
+      const numbers = bySender.get(row.user_id) ?? [];
+      numbers.push(row.user_record_number);
+      bySender.set(row.user_id, numbers);
+    }
+
+    expect(bySender.get(senderA)).toEqual([1, 2, 3, 4]);
+    expect(bySender.get(senderB)).toEqual([1, 2]);
+    expect(new Set([...initial, ...concurrent].map((post) => post.id)).size).toBe(6);
+  });
+
+  it("shows owner identity on moderation cards but hides it from ordinary admins", async () => {
+    const owner = Number(env.OWNER_TELEGRAM_ID);
+    await createUser(null, owner);
+    const admin = await createUser();
+    const sender = await createUser();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO profiles (user_id, nickname) VALUES (?, 'لقب پنهان')
+    `).bind(sender).run();
+    await env.CRASH_BOT_DB.prepare("INSERT INTO admin_roles (user_id) VALUES (?)")
+      .bind(admin).run();
+    const post = await submitPost(
+      env, { id: sender, username: "private_sender_name" },
+      { message_id: 3002, text: "پیام بررسی" }
+    );
+    const queue = await env.CRASH_BOT_DB.prepare(
+      "SELECT id FROM admin_queue WHERE item_id = ?"
+    ).bind(post.id).first();
+    const messages = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      const payload = JSON.parse(init.body);
+      messages.push(payload);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, result: { message_id: messages.length } })
+      };
+    }));
+
+    await notifyModerators(env, queue.id);
+
+    const ownerText = messages.find((message) => String(message.chat_id) === String(owner)).text;
+    const adminText = messages.find((message) => String(message.chat_id) === String(admin)).text;
+    expect(ownerText).toContain(`شماره رکورد فرستنده: 1`);
+    expect(ownerText).toContain(String(sender));
+    expect(ownerText).toContain("@private_sender_name");
+    expect(ownerText).toContain("لقب پنهان");
+    expect(adminText).toContain("شماره رکورد فرستنده: 1");
+    expect(adminText).not.toContain(String(sender));
+    expect(adminText).not.toContain("@private_sender_name");
+    expect(adminText).not.toContain("لقب پنهان");
+  });
+
   it("allows only one concurrent moderator decision", async () => {
     const sender = await createUser();
     const adminA = await createUser();
@@ -577,6 +750,7 @@ describe("owner-only archive repost", () => {
       message_id: 808
     });
     vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    const edit = vi.spyOn(telegramApi, "editInlineTelegram").mockResolvedValue(true);
 
     await renderPostArchive(env, owner, owner);
     await handleArchiveCallback(env, callback(owner, "archive:all:0"));
@@ -589,8 +763,8 @@ describe("owner-only archive repost", () => {
       "SELECT status FROM publication_jobs WHERE item_id = ?"
     ).bind(post.id).first();
     expect(job.status).toBe("unknown");
-    expect(telegramApi.sendInlineTelegram.mock.calls.some((call) =>
-      call[3]?.some((row) => row.some((button) =>
+    expect(edit.mock.calls.some((call) =>
+      call[4]?.some((row) => row.some((button) =>
         button.callback_data === `post:recover:${post.id}`))
     )).toBe(true);
   });
@@ -616,8 +790,8 @@ describe("owner-only archive repost", () => {
 
     await renderPostArchive(env, owner, owner);
     await handleArchiveCallback(env, callback(owner, "archive:all:0"));
-    expect(telegramApi.sendInlineTelegram.mock.calls.some((call) =>
-      call[3]?.some((row) => row.some((button) =>
+    expect(telegramApi.editInlineTelegram.mock.calls.some((call) =>
+      call[4]?.some((row) => row.some((button) =>
         button.callback_data === `post:repost:${post.id}`))
     )).toBe(true);
     await handlePostCallback(env, callback(admin, `post:repost:${post.id}`));
@@ -693,7 +867,63 @@ describe("deep link privacy", () => {
       type: "post_history",
       entityId: post.id
     });
+
     await expect(resolveDeepLinkToken(env, token, other)).resolves.toBeNull();
     await expect(resolveDeepLinkToken(env, "1", other)).resolves.toBeNull();
+  });
+});
+
+describe("user post history pagination", () => {
+  it("paginates by stable creation order and edits the existing history screen", async () => {
+    const sender = await createUser();
+    const posts = [];
+    for (let index = 0; index < 12; index += 1) {
+      posts.push(await createPost(sender, {
+        message_id: 900 + index,
+        text: `history entry ${index}`
+      }));
+    }
+    const send = vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    const edit = vi.spyOn(telegramApi, "editInlineTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+
+    await listUserPosts(env, sender, sender);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][2]).toContain("12 مورد");
+    expect(send.mock.calls[0][2]).toContain("#12 ·");
+    expect(send.mock.calls[0][2]).toContain("#3 ·");
+    expect(send.mock.calls[0][2]).not.toContain("#2 ·");
+    expect(send.mock.calls[0][3].flat().map((button) => button.callback_data))
+      .toContain("post:user-history:1");
+    expect(send.mock.calls[0][3].flat().map((button) => button.callback_data))
+      .toContain(`post:history:${posts[11].id}`);
+
+    await handlePostHistoryCallback(env, callback(sender, "post:user-history:1"));
+    expect(edit.mock.calls.at(-1)[2]).toBe(777);
+    expect(edit.mock.calls.at(-1)[3]).toContain("#2 ·");
+    expect(edit.mock.calls.at(-1)[3]).toContain("#1 ·");
+    expect(edit.mock.calls.at(-1)[3]).toContain("صفحه 2/2");
+
+    await handlePostHistoryCallback(env, callback(sender, "post:user-history:99"));
+    expect(edit.mock.calls.at(-1)[3]).toContain("صفحه 2/2");
+    expect(edit.mock.calls.every((call) => call[2] === 777)).toBe(true);
+  });
+
+  it("renders operational post timestamps in Asia/Tehran", async () => {
+    const sender = await createUser();
+    const post = await createPost(sender);
+    await env.CRASH_BOT_DB.prepare(`
+      UPDATE posts SET created_at = '2026-01-01 12:00:00',
+        reviewed_at = '2026-01-01 13:00:00'
+      WHERE id = ?
+    `).bind(post.id).run();
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+
+    await handlePostHistoryCallback(env, callback(sender, `post:history:${post.id}`));
+
+    expect(send.mock.calls.at(-1)[2]).toContain("1404/10/11, 15:30");
+    expect(send.mock.calls.at(-1)[2]).toContain("1404/10/11, 16:30");
+    expect(send.mock.calls.at(-1)[2]).not.toContain("UTC");
   });
 });

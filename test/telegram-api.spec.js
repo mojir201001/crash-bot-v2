@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   sendInlineTelegramDetailed,
   sendMediaTelegram,
-  sendMediaTelegramDetailed
+  sendMediaTelegramDetailed,
+  sendMessageTelegramDetailed,
+  sendTelegram
 } from "../src/telegram/api.js";
 
 const env = {};
@@ -51,6 +53,15 @@ describe("Telegram send outcome classification", () => {
     })).resolves.toEqual({ outcome: "unknown" });
   });
 
+  it("does not throw on network failures in boolean Telegram helpers", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("connection reset");
+    }));
+
+    await expect(sendTelegram(env, 123, "safe failure"))
+      .resolves.toBe(false);
+  });
+
   it("treats server errors and malformed success payloads as uncertain", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: false,
@@ -67,5 +78,73 @@ describe("Telegram send outcome classification", () => {
     })));
     await expect(sendInlineTelegramDetailed(env, 123, "text", []))
       .resolves.toEqual({ outcome: "unknown" });
+  });
+});
+
+describe("Reply keyboard lifecycle", () => {
+  it("replies to the specified message without changing keyboard semantics", async () => {
+    let payload;
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      payload = JSON.parse(init.body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, result: { message_id: 10 } })
+      };
+    }));
+
+    await sendMessageTelegramDetailed(env, 123, "status", null, 456);
+
+    expect(payload).toMatchObject({
+      chat_id: 123,
+      text: "status",
+      reply_parameters: { message_id: 456 }
+    });
+    expect(payload.reply_markup).toBeUndefined();
+  });
+
+  it("preserves, replaces, and removes the keyboard only when requested", async () => {
+    const calls = [];
+    vi.stubGlobal("fetch", vi.fn(async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          result: { message_id: calls.length }
+        })
+      };
+    }));
+
+    await sendMessageTelegramDetailed(env, 123, "Keep current keyboard");
+    const replacement = [[{ text: "🏠 منوی اصلی" }]];
+    await sendMessageTelegramDetailed(env, 123, "Replace keyboard", replacement);
+    await sendMessageTelegramDetailed(env, 123, "Remove keyboard", []);
+
+    expect(calls.map(({ body }) => body.reply_markup)).toEqual([
+      undefined,
+      { keyboard: replacement, resize_keyboard: true, is_persistent: false },
+      { remove_keyboard: true }
+    ]);
+  });
+
+  it("does not delete an earlier main-screen message", async () => {
+    const calls = [];
+    vi.stubGlobal("fetch", vi.fn(async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, result: { message_id: calls.length } })
+      };
+    }));
+
+    const keyboard = [[{ text: "🏠 منوی اصلی" }]];
+    await sendTelegram(env, 123, "👋 سلام، به کراش‌یاب ادیب خوش اومدی!", keyboard);
+    await sendTelegram(env, 123, "👋 سلام، به کراش‌یاب ادیب خوش اومدی!", keyboard);
+
+    expect(calls.map(({ url }) => url.split("/").at(-1)))
+      .toEqual(["sendMessage", "sendMessage"]);
   });
 });

@@ -190,7 +190,13 @@ describe("Crash Bot worker", () => {
       if (query.includes("FROM admin_roles")) {
         return { bind: () => ({ first: async () => null }) };
       }
-      return { bind: () => ({ first: async () => null, run: async () => ({ success: true }) }) };
+return {
+  bind: () => ({
+    first: async () => null,
+    all: async () => ({ results: [] }),
+    run: async () => ({ success: true })
+  })
+};
     });
 
     const request = new Request("http://example.com/webhook", {
@@ -231,7 +237,13 @@ describe("Crash Bot worker", () => {
       if (query.includes("SELECT is_blocked, account_status")) {
         return { bind: () => ({ first: async () => ({ is_blocked: 0, account_status: "active" }) }) };
       }
-      return { bind: () => ({ first: async () => null, run: async () => ({ success: true }) }) };
+      return {
+  bind: () => ({
+    first: async () => null,
+    all: async () => ({ results: [] }),
+    run: async () => ({ success: true })
+  })
+};
     });
 
     const request = new Request("http://example.com/webhook", {
@@ -307,8 +319,13 @@ it("denies a regular user direct access to the admin home route", async () => {
     if (query.includes("FROM admin_roles")) {
       return { bind: () => ({ first: async () => null }) };
     }
-    return { bind: () => ({ first: async () => null, run: async () => ({ success: true }) }) };
-  });
+return {
+  bind: () => ({
+    first: async () => null,
+    all: async () => ({ results: [] }),
+    run: async () => ({ success: true })
+  })
+};  });
 
   const request = new Request("http://example.com/webhook", {
     method: "POST",

@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as telegramApi from "../src/telegram/api.js";
 import {
   buildManagementWorkbook,
-  exportManagementWorkbook
+  exportManagementWorkbook,
+  handleExportWorkbookCallback
 } from "../src/services/xlsx-export.js";
 
 const userId = 740000001;
@@ -44,6 +45,12 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  await env.CRASH_BOT_DB.prepare(
+    "DELETE FROM owner_export_documents WHERE owner_id = ?"
+  ).bind(ownerId).run();
+  await env.CRASH_BOT_DB.prepare(
+    "DELETE FROM owner_export_jobs WHERE owner_id = ?"
+  ).bind(ownerId).run();
   await env.CRASH_BOT_DB.prepare(`
     DELETE FROM post_events
     WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)
@@ -71,6 +78,8 @@ describe("management Excel export", () => {
       id: 10,
       reply_to_post_id: null,
       nickname: "لقب فارسی",
+      user_id: 740000001,
+      sender_username: "excel_sender",
       status: "pending",
       content: "=HYPERLINK(\"https://example.invalid\")",
       created_at: "2026-01-01 12:00:00",
@@ -82,15 +91,19 @@ describe("management Excel export", () => {
     const sheet = entries.get("xl/worksheets/sheet1.xml");
     expect(sheet).toContain("شناسهٔ رکورد");
     expect(sheet).toContain("لقب فارسی");
+    expect(sheet).toContain("شناسهٔ تلگرام فرستنده");
+    expect(sheet).toContain("<c r=\"D2\"><v>740000001</v></c>");
+    expect(sheet).toContain("@excel_sender");
     expect(sheet).toContain("&apos;=HYPERLINK");
     expect(sheet).not.toContain("<f>");
     expect(sheet).toContain("Asia/Tehran");
+    expect(sheet).toContain("۱۵:۳۰");
   });
 
   it("exports only through the owner-only route and sends a real xlsx document payload", async () => {
     const post = await env.CRASH_BOT_DB.prepare(`
-      INSERT INTO posts (user_id, content, status)
-      VALUES (?, 'محتوای آزمایشی', 'pending') RETURNING id
+      INSERT INTO posts (user_id, sender_username, content, status)
+      VALUES (?, 'excel_sender', 'محتوای آزمایشی', 'pending') RETURNING id
     `).bind(userId).first();
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ ok: true, result: { message_id: 200 } }), {
@@ -110,8 +123,199 @@ describe("management Excel export", () => {
     const sheet = entries.get("xl/worksheets/sheet1.xml");
     expect(sheet).toContain("محتوای آزمایشی");
     expect(sheet).toContain("لقب فارسی");
-    expect(sheet).not.toContain(String(userId));
+    expect(sheet).toContain("<c r=\"D2\"><v>740000001</v></c>");
+    expect(sheet).toContain("@excel_sender");
     expect(post.id).toBeTruthy();
+  });
+
+  it("exports all records beyond the former cap in bounded files with unchanged columns", async () => {
+    const inserts = Array.from({ length: 1001 }, (_, index) =>
+      env.CRASH_BOT_DB.prepare(`
+        INSERT INTO posts (user_id, sender_username, content, status)
+        VALUES (?, 'excel_sender', ?, 'pending')
+      `).bind(userId, `batch-row-${String(index + 1).padStart(3, "0")}`)
+    );
+    for (let offset = 0; offset < inserts.length; offset += 200) {
+      await env.CRASH_BOT_DB.batch(inserts.slice(offset, offset + 200));
+    }
+    let messageId = 200;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({ ok: true, result: { message_id: ++messageId } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+
+    const result = await exportManagementWorkbook(env, ownerId, ownerId);
+
+    expect(result).toEqual({
+      outcome: "sent", rows: 1001, parts: 2, previousFilesDeleted: true
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const files = fetchSpy.mock.calls.map((call) => call[1].body.get("document"));
+    expect(files.map((file) => file.name)).toEqual([
+      expect.stringMatching(/-001-of-002\.xlsx$/),
+      expect.stringMatching(/-002-of-002\.xlsx$/)
+    ]);
+    const sheets = await Promise.all(files.map(async (file) =>
+      unzipStored(new Uint8Array(await file.arrayBuffer()))
+        .get("xl/worksheets/sheet1.xml")
+    ));
+    expect((sheets[0].match(/<row r=/g) ?? [])).toHaveLength(1001);
+    expect((sheets[1].match(/<row r=/g) ?? [])).toHaveLength(2);
+    expect(sheets[0]).toContain("batch-row-1001");
+    expect(sheets[1]).toContain("batch-row-001");
+    const headers = [
+      "شناسهٔ رکورد", "نوع", "لقب نویسنده",
+      "شناسهٔ تلگرام فرستنده", "نام کاربری فرستنده",
+      "شناسهٔ پست اصلی", "وضعیت", "متن",
+      "زمان ثبت (Asia/Tehran)", "زمان تصمیم (Asia/Tehran)"
+    ];
+    let previousPosition = -1;
+    for (const header of headers) {
+      const position = sheets[0].indexOf(header);
+      expect(position).toBeGreaterThan(previousPosition);
+      previousPosition = position;
+    }
+  });
+
+  it("replaces the previous Excel files only after the replacement is fully delivered", async () => {
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO posts (user_id, sender_username, content, status)
+      VALUES (?, 'excel_sender', 'replacement test', 'pending')
+    `).bind(userId).run();
+    let nextMessageId = 300;
+    let failDocument = false;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+      if (String(url).endsWith("/deleteMessage")) {
+        return new Response(JSON.stringify({ ok: true, result: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (failDocument) {
+        return new Response(JSON.stringify({ ok: false, description: "failed" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({
+        ok: true, result: { message_id: ++nextMessageId }
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    });
+
+    await exportManagementWorkbook(env, ownerId, ownerId);
+    const previous = await env.CRASH_BOT_DB.prepare(`
+      SELECT message_id FROM owner_export_documents WHERE owner_id = ?
+    `).bind(ownerId).all();
+    expect(previous.results).toHaveLength(1);
+
+    failDocument = true;
+    const failed = await exportManagementWorkbook(env, ownerId, ownerId);
+    expect(failed.outcome).toBe("rejected");
+    expect(fetchSpy.mock.calls.some((call) =>
+      String(call[0]).endsWith("/deleteMessage")
+    )).toBe(false);
+    const preserved = await env.CRASH_BOT_DB.prepare(`
+      SELECT message_id FROM owner_export_documents WHERE owner_id = ?
+    `).bind(ownerId).all();
+    expect(preserved.results).toEqual(previous.results);
+
+    failDocument = false;
+    const replacement = await exportManagementWorkbook(env, ownerId, ownerId);
+    expect(replacement.previousFilesDeleted).toBe(true);
+    expect(fetchSpy.mock.calls.some((call) =>
+      String(call[0]).endsWith("/deleteMessage")
+    )).toBe(true);
+    const current = await env.CRASH_BOT_DB.prepare(`
+      SELECT message_id FROM owner_export_documents WHERE owner_id = ?
+    `).bind(ownerId).all();
+    expect(current.results).toHaveLength(1);
+    expect(current.results[0].message_id).not.toBe(previous.results[0].message_id);
+  });
+
+  it("continues exports beyond one Worker invocation without losing rows", async () => {
+    const inserts = Array.from({ length: 10001 }, (_, index) =>
+      env.CRASH_BOT_DB.prepare(`
+        INSERT INTO posts (user_id, sender_username, content, status)
+        VALUES (?, 'excel_sender', ?, 'pending')
+      `).bind(userId, `worker-batch-row-${index + 1}`)
+    );
+    for (let offset = 0; offset < inserts.length; offset += 250) {
+      await env.CRASH_BOT_DB.batch(inserts.slice(offset, offset + 250));
+    }
+
+    let messageId = 500;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({
+        ok: true, result: { message_id: ++messageId }
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    const first = await exportManagementWorkbook(env, ownerId, ownerId);
+    expect(first).toMatchObject({
+      outcome: "pending", rows: 10000, parts: 10, totalRows: 10001
+    });
+
+    const continuationCall = fetchSpy.mock.calls.map(([url, init]) => {
+      if (!String(url).endsWith("/sendMessage") || typeof init.body !== "string") {
+        return null;
+      }
+      return JSON.parse(init.body);
+    }).find((body) => body?.reply_markup?.inline_keyboard?.flat().some((button) =>
+      String(button.callback_data).startsWith("xlsx:continue:")
+    ));
+    const continuation = continuationCall.reply_markup.inline_keyboard.flat()
+      .find((button) => String(button.callback_data).startsWith("xlsx:continue:"))
+      .callback_data;
+    const completed = await handleExportWorkbookCallback(env, {
+      id: "xlsx-continuation",
+      data: continuation,
+      from: { id: ownerId },
+      message: { chat: { id: ownerId, type: "private" }, message_id: 999 }
+    });
+    expect(completed).toBe(true);
+    expect(fetchSpy.mock.calls.filter(([url]) =>
+      String(url).endsWith("/sendDocument")
+    )).toHaveLength(11);
+    const documents = await env.CRASH_BOT_DB.prepare(`
+      SELECT COUNT(*) AS count FROM owner_export_documents
+      WHERE owner_id = ? AND status = 'current'
+    `).bind(ownerId).first();
+    expect(documents.count).toBe(11);
+    const remaining = await env.CRASH_BOT_DB.prepare(`
+      SELECT COUNT(*) AS count FROM owner_export_jobs
+      WHERE owner_id = ? AND status != 'complete'
+    `).bind(ownerId).first();
+    expect(remaining.count).toBe(0);
+  });
+
+  it("does not start a second Excel export for a duplicate Telegram update", async () => {
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO posts (user_id, sender_username, content, status)
+      VALUES (?, 'excel_sender', 'duplicate update test', 'pending')
+    `).bind(userId).run();
+    let messageId = 700;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({
+        ok: true, result: { message_id: ++messageId }
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+    const first = await exportManagementWorkbook(env, ownerId, ownerId, 456);
+    const duplicate = await exportManagementWorkbook(env, ownerId, ownerId, 456);
+    expect(first.outcome).toBe("sent");
+    expect(duplicate).toMatchObject({ outcome: "sent", duplicate: true });
+    expect(fetchSpy.mock.calls.filter(([url]) =>
+      String(url).endsWith("/sendDocument")
+    )).toHaveLength(1);
   });
 
   it("does not send a spreadsheet to an admin or a non-owner", async () => {

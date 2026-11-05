@@ -120,8 +120,7 @@ export async function startBroadcast(env, ownerId, chatId) {
   const sent = await sendTrackedSectionNoticeTelegram(
     env,
     chatId,
-    "محتوای پیام همگانی را به‌صورت متن یا رسانه بفرست. پیش از ارسال، پیش‌نمایش و تأیید نهایی نمایش داده می‌شود. برای لغو «لغو» بنویس.",
-    []
+    "محتوای پیام همگانی را به‌صورت متن یا رسانه بفرست. پیش از ارسال، پیش‌نمایش و تأیید نهایی نمایش داده می‌شود. برای لغو «لغو» بنویس."
   );
   if (!sent) throw new Error("Could not start broadcast input");
   return true;
@@ -153,8 +152,7 @@ export async function handleBroadcastMessage(env, message, ownerId, isNavigation
     await sendTrackedSectionNoticeTelegram(
       env,
       message.chat.id,
-      `پیام نامعتبر یا بیش از حد طولانی است. متن حداکثر ${MAX_TEXT_LENGTH} نویسه و کپشن رسانه حداکثر ${MAX_CAPTION_LENGTH} نویسه است.`,
-      []
+      `پیام نامعتبر یا بیش از حد طولانی است. متن حداکثر ${MAX_TEXT_LENGTH} نویسه و کپشن رسانه حداکثر ${MAX_CAPTION_LENGTH} نویسه است.`
     );
     return true;
   }

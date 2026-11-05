@@ -65,6 +65,8 @@ describe("active Worker advertising route", () => {
     vi.spyOn(telegramApi, "sendTrackedSectionInlineTelegram").mockResolvedValue(true);
     vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
       .mockResolvedValue({ outcome: "sent" });
+    vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 32 });
     vi.spyOn(telegramApi, "deleteTelegramMessage").mockResolvedValue(false);
 
     const entry = await postUpdate({
@@ -99,7 +101,7 @@ describe("active Worker advertising route", () => {
       message: "می‌خواهم دربارهٔ تبلیغ گفت‌وگو کنم",
       delivery_status: "sent"
     });
-    expect(telegramApi.sendMessageTelegramDetailed.mock.calls.some((call) =>
+    expect(telegramApi.sendInlineTelegramDetailed.mock.calls.some((call) =>
       String(call[1]) === String(env.OWNER_TELEGRAM_ID) &&
       call[2].includes(`Telegram ID: ${userId}`)
     )).toBe(true);

@@ -68,7 +68,7 @@ export async function getBotRules(env) {
 
 export async function renderBotRules(env, chatId) {
   const rules = await getBotRules(env);
-  const sent = await sendTrackedSectionNoticeTelegram(env, chatId, rules, []);
+  const sent = await sendTrackedSectionNoticeTelegram(env, chatId, rules);
   if (!sent) throw new Error("Could not display bot rules");
 }
 
@@ -80,8 +80,7 @@ export async function startRulesEdit(env, ownerId, chatId) {
   const sent = await sendTrackedSectionNoticeTelegram(
     env,
     chatId,
-    `📖 متن فعلی قوانین:\n\n${current.slice(0, 3000)}\n\nمتن جدید را بفرست (حداکثر ${MAX_RULES_LENGTH} نویسه). برای لغو «لغو» بنویس.`,
-    []
+    `📖 متن فعلی قوانین:\n\n${current.slice(0, 3000)}\n\nمتن جدید را بفرست (حداکثر ${MAX_RULES_LENGTH} نویسه). برای لغو «لغو» بنویس.`
   );
   if (!sent) throw new Error("Could not start rules edit");
   return true;
@@ -107,8 +106,7 @@ export async function handleRulesMessage(env, message, ownerId, isNavigation = f
     await sendTrackedSectionNoticeTelegram(
       env,
       message.chat.id,
-      `متن قوانین باید غیرخالی و حداکثر ${MAX_RULES_LENGTH} نویسه باشد. متن دیگری بفرست یا «لغو» بنویس.`,
-      []
+      `متن قوانین باید غیرخالی و حداکثر ${MAX_RULES_LENGTH} نویسه باشد. متن دیگری بفرست یا «لغو» بنویس.`
     );
     return true;
   }

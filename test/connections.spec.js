@@ -1,13 +1,19 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as telegramApi from "../src/telegram/api.js";
+import * as anonymousChat from "../src/services/anonymous-chat.js";
 import {
   handleConnectionCallback,
   handleConnectionMessage,
-  handleStartToken
+  handleStartToken,
+  renderConnections
 } from "../src/services/connections.js";
 import { createDeepLinkToken } from "../src/services/posts.js";
-import { saveProfileField, getProfile } from "../src/services/profile.js";
+import {
+  getProfile,
+  saveInterest,
+  saveProfileField
+} from "../src/services/profile.js";
 
 const fixtureUsers = new Set();
 const fixtureSettings = new Set();
@@ -25,11 +31,11 @@ async function createUser(username = null) {
     ["city", "تهران"],
     ["birth_year", "1380"],
     ["birth_month", "فروردین"],
-    ["marital_status", "single"],
-    ["gender", "woman"],
+    ["marital_status", "مجرد"],
+    ["gender", "زن"],
     ["job", "آزمایش"],
-    ["religion", "محرمانه"],
-    ["religious_sect", "خصوصی"],
+    ["religion", "اسلام"],
+    ["religious_sect", "شیعه"],
     ["field", "علوم آزمایشگاهی"],
     ["image_file_id", "profile-file-id"]
   ]) {
@@ -151,6 +157,85 @@ describe("channel connection requests and private profile", () => {
     expect(send.mock.calls.at(-1)[2]).toContain("درخواست ارتباط برای این مورد امکان‌پذیر نیست.");
   });
 
+  it("scopes a stale cancel callback to its original connection request", async () => {
+    const firstOwner = await createUser();
+    const secondOwner = await createUser();
+    const requester = await createUser();
+    const firstPost = await createPublishedPost(firstOwner);
+    const secondPost = await createPublishedPost(secondOwner);
+    const firstToken = await createDeepLinkToken(env, "connect", firstPost);
+    const secondToken = await createDeepLinkToken(env, "connect", secondPost);
+
+    await handleStartToken(env, requester, requester, firstToken);
+    await handleStartToken(env, requester, requester, secondToken);
+    await handleConnectionCallback(
+      env, callback(requester, `connection:cancel:${firstPost}`)
+    );
+
+    let flow = await env.CRASH_BOT_DB.prepare(`
+      SELECT flow_type, entity_id FROM user_conversations WHERE user_id = ?
+    `).bind(requester).first();
+    expect(flow).toEqual({ flow_type: "connection_confirm", entity_id: secondPost });
+
+    await handleConnectionCallback(env, callback(requester, "connection:cancel"));
+    flow = await env.CRASH_BOT_DB.prepare(`
+      SELECT flow_type, entity_id FROM user_conversations WHERE user_id = ?
+    `).bind(requester).first();
+    expect(flow.entity_id).toBe(secondPost);
+
+    await handleConnectionCallback(
+      env, callback(requester, `connection:cancel:${secondPost}`)
+    );
+    expect(await env.CRASH_BOT_DB.prepare(
+      "SELECT user_id FROM user_conversations WHERE user_id = ?"
+    ).bind(requester).first()).toBeNull();
+  });
+
+  it("uses the sender's record number in user-facing connection and history screens", async () => {
+    const owner = await createUser();
+    const viewer = await createUser();
+    await createPublishedPost(owner);
+    const postId = await createPublishedPost(owner);
+    const post = await env.CRASH_BOT_DB.prepare(`
+      SELECT id, user_record_number FROM posts WHERE id = ?
+    `).bind(postId).first();
+    expect(post.id).not.toBe(post.user_record_number);
+    const connectToken = await createDeepLinkToken(env, "connect", postId);
+    const historyToken = await createDeepLinkToken(
+      env, "post_history", postId, owner
+    );
+    const inline = vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+
+    await handleStartToken(env, viewer, viewer, connectToken);
+    expect(inline.mock.calls.at(-1)[2]).toContain(`#${post.user_record_number}`);
+    expect(inline.mock.calls.at(-1)[2]).not.toContain(`#${post.id}`);
+
+    await handleStartToken(env, owner, owner, historyToken);
+    expect(send.mock.calls.at(-1)[2]).toContain(`#${post.user_record_number}`);
+    expect(send.mock.calls.at(-1)[2]).not.toContain(`#${post.id}`);
+  });
+
+  it("includes gender and marital status in the private connection request", async () => {
+    const recipient = await createUser();
+    const requester = await createUser();
+    const postId = await createPublishedPost(recipient);
+    const token = await createDeepLinkToken(env, "connect", postId);
+    const notice = vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 777 });
+
+    await handleStartToken(env, requester, requester, token);
+    await handleConnectionCallback(
+      env, callback(requester, `connection:confirm:${postId}`)
+    );
+
+    const sentNotice = notice.mock.calls.find((call) =>
+      String(call[1]) === String(recipient)
+    );
+    expect(sentNotice?.[2]).toContain("وضعیت تأهل: مجرد");
+    expect(sentNotice?.[2]).toContain("جنسیت: زن");
+  });
+
   it("rejects an empty message without supported media in an active connection chat", async () => {
     const first = await createUser();
     const second = await createUser();
@@ -204,6 +289,9 @@ describe("channel connection requests and private profile", () => {
       "SELECT status FROM connection_requests WHERE id = ?"
     ).bind(request.id).first();
     expect(state.status).toBe("accepted");
+    await handleConnectionCallback(
+      env, callback(requester, `connection:chat:${request.id}`)
+    );
 
     const chatMessage = {
       from: { id: requester },
@@ -227,9 +315,9 @@ describe("channel connection requests and private profile", () => {
       source_message_id: 991
     });
     const notificationCount = await env.CRASH_BOT_DB.prepare(`
-      SELECT COUNT(*) AS count FROM notification_outbox
-      WHERE event_key = (
-        SELECT 'connection-message:' || id FROM anonymous_messages
+      SELECT COUNT(*) AS count FROM anonymous_message_inbox
+      WHERE message_id = (
+        SELECT id FROM anonymous_messages
         WHERE connection_id = ? AND source_message_id = 991
       )
     `).bind(request.id).first();
@@ -253,29 +341,151 @@ describe("channel connection requests and private profile", () => {
     expect(outsiderMessages.count).toBe(0);
   });
 
-  it("shows only selected bot-profile fields and exits without deleting the source profile", async () => {
+  it("lists active chats by counterpart nickname and displays the 20 latest messages", async () => {
+    const owner = await createUser();
+    const firstPeer = await createUser();
+    const secondPeer = await createUser();
+    await saveProfileField(env, firstPeer, "nickname", "لقب اول");
+    await saveProfileField(env, secondPeer, "nickname", "لقب دوم");
+    const first = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'accepted') RETURNING id
+    `).bind(owner, firstPeer).first();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'accepted')
+    `).bind(secondPeer, owner).run();
+    for (let index = 0; index < 22; index += 1) {
+      const createdAt = new Date(Date.UTC(2026, 0, 1, 0, 0, index))
+        .toISOString().replace("T", " ").slice(0, 19);
+      await env.CRASH_BOT_DB.prepare(`
+        INSERT INTO anonymous_messages
+          (sender_id, recipient_id, message, message_type, connection_id, created_at)
+        VALUES (?, ?, ?, 'connection', ?, ?)
+      `).bind(
+        index % 2 === 0 ? owner : firstPeer,
+        index % 2 === 0 ? firstPeer : owner,
+        `پیام ${index}`, first.id, createdAt
+      ).run();
+    }
+
+    const inline = vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    const message = vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 902 });
+    vi.spyOn(telegramApi, "sendMediaTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 903 });
+
+    await renderConnections(env, owner, owner, "active");
+    const listButtons = inline.mock.calls.map((call) => call[3][0][0]);
+    expect(listButtons.map((button) => button.text)).toEqual([
+      "لقب دوم", "لقب اول"
+    ]);
+
+    await handleConnectionCallback(env, callback(owner, `connection:chat:${first.id}`));
+    const replayed = message.mock.calls;
+    expect(replayed).toHaveLength(20);
+    expect(replayed.map((call) => call[2].match(/پیام (\d+)/)?.[1]))
+      .toEqual(Array.from({ length: 20 }, (_, index) => String(index + 2)));
+    expect(replayed[0][3]).toEqual(expect.arrayContaining([
+      expect.arrayContaining([
+        expect.objectContaining({ text: "↩️ پاسخ به پیام" }),
+        expect.objectContaining({ text: "🚫 مسدود کردن گفت‌وگو" })
+      ]),
+      expect.arrayContaining([
+        expect.objectContaining({ text: "📜 تازه‌سازی همین تاریخچه" })
+      ])
+    ]));
+  });
+
+  it("rechecks a conversation block atomically before persisting a connection message", async () => {
+    const sender = await createUser();
+    const recipient = await createUser();
+    const request = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'accepted') RETURNING id
+    `).bind(sender, recipient).first();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO user_conversations (user_id, flow_type, entity_id)
+      VALUES (?, 'connection_chat', ?)
+    `).bind(sender, request.id).run();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO conversation_blocks
+        (conversation_type, conversation_id, blocker_id, blocked_id)
+      VALUES ('connection', ?, ?, ?)
+    `).bind(request.id, recipient, sender).run();
+    vi.spyOn(anonymousChat, "isConversationBlocked").mockResolvedValue(false);
+
+    await handleConnectionMessage(env, {
+      from: { id: sender },
+      chat: { id: sender },
+      message_id: 9991,
+      text: "پیام هم‌زمان با مسدودسازی"
+    }, sender);
+
+    const stored = await env.CRASH_BOT_DB.prepare(`
+      SELECT COUNT(*) AS count FROM anonymous_messages
+      WHERE connection_id = ? AND source_message_id = 9991
+    `).bind(request.id).first();
+    expect(stored.count).toBe(0);
+    const inbox = await env.CRASH_BOT_DB.prepare(`
+      SELECT COUNT(*) AS count FROM anonymous_message_inbox
+      WHERE message_id IN (
+        SELECT id FROM anonymous_messages WHERE connection_id = ?
+      )
+    `).bind(request.id).first();
+    expect(inbox.count).toBe(0);
+  });
+
+  it("shows the complete public profile and interests without exposing private identifiers", async () => {
     const owner = await createUser("private_username");
     const viewer = await createUser();
     const postId = await createPublishedPost(owner);
     const token = await createDeepLinkToken(env, "profile", postId);
-    const media = vi.spyOn(telegramApi, "sendMediaTelegram").mockResolvedValue({ message_id: 700 });
+    await saveInterest(env, owner, {
+      category: "کتاب",
+      content: "ادبیات داستانی"
+    });
+    await saveInterest(env, owner, {
+      category: "هنر",
+      content: "عکاسی",
+      mediaType: "photo",
+      mediaFileId: "public-interest-photo",
+      caption: "عکس طبیعت"
+    });
+    const media = vi.spyOn(telegramApi, "sendMediaTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 700 });
     const inline = vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
     const answers = vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
-    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
 
     await handleStartToken(env, viewer, viewer, token);
     expect(media).toHaveBeenCalledWith(env, "sendPhoto", expect.objectContaining({
       chat_id: viewer,
-      photo: expect.any(String),
+      photo: "profile-file-id",
       parse_mode: "HTML"
     }));
     const publicText = media.mock.calls[0][2].caption;
-    expect(publicText).toContain("لقب عمومی");
+    expect(publicText).toContain("👤 لقب عمومی");
+    expect(publicText).toContain("دربارهٔ من: اطلاعات عمومی");
+    expect(publicText).toContain("شهر: تهران");
     expect(publicText).toContain("سن:");
+    expect(publicText).toContain("شغل: آزمایش");
+    expect(publicText).toContain("رشتهٔ تحصیلی: علوم آزمایشگاهی");
+    expect(publicText).toContain("وضعیت تأهل: مجرد");
+    expect(publicText).toContain("جنسیت: زن");
+    expect(publicText).toContain("مذهب: اسلام");
+    expect(publicText).toContain("فرقه: شیعه");
+    expect(publicText).toContain("کتاب: ادبیات داستانی");
+    expect(publicText).toContain("هنر: عکاسی");
+    expect(media).toHaveBeenCalledWith(env, "sendPhoto", expect.objectContaining({
+      chat_id: viewer,
+      photo: "public-interest-photo",
+      caption: expect.stringContaining("عکس طبیعت")
+    }));
     expect(publicText).not.toContain(String(owner));
     expect(publicText).not.toContain("private_username");
-    expect(publicText).not.toContain("محرمانه");
-    expect(publicText).not.toContain("1380");
+    expect(publicText).not.toContain("۱۳۸۰");
 
     await handleConnectionCallback(env, callback(viewer, "profile:exit"));
     const flow = await env.CRASH_BOT_DB.prepare(
@@ -284,7 +494,6 @@ describe("channel connection requests and private profile", () => {
     expect(flow).toBeNull();
     expect((await getProfile(env, owner)).nickname).toBe("لقب عمومی");
     expect(answers).toHaveBeenCalled();
-    expect(send).toHaveBeenCalled();
     expect(inline).toHaveBeenCalled();
   });
 });

@@ -79,6 +79,8 @@ describe("owner-managed rules and settings", () => {
   it("serves a single default rules source and stores owner-confirmed versions", async () => {
     expect(await getBotRules(env)).toBe(DEFAULT_BOT_RULES);
     await startRulesEdit(env, ownerId, ownerId);
+    expect(telegramApi.sendTrackedSectionNoticeTelegram.mock.calls.at(-1)[3])
+      .toBeUndefined();
     await handleRulesMessage(env, message("قانون جدید و معتبر"), ownerId);
     expect(telegramApi.sendTrackedSectionInlineTelegram).toHaveBeenCalled();
     await handleRulesCallback(env, callback(ownerId, "rules:confirm"));
@@ -124,6 +126,8 @@ describe("owner-managed rules and settings", () => {
       env,
       callback(ownerId, "settings:edit:crash_channel_id")
     );
+    expect(telegramApi.sendTrackedSectionNoticeTelegram.mock.calls.at(-1)[3])
+      .toBeUndefined();
     await handleSettingsMessage(env, message("نامعتبر"), ownerId);
     expect((await readStored("crash_channel_id")).value).toBe("@oldchannel");
     await handleSettingsMessage(env, message("@newchannel"), ownerId);

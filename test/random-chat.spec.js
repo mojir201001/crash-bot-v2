@@ -202,6 +202,74 @@ describe("random anonymous chat", () => {
     expect(session.user_a_id).toBe(man);
   });
 
+  it("atomically matches two compatible users searching at the same time", async () => {
+    const man = await createUser("man");
+    const woman = await createUser("woman");
+    vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 99 });
+    vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 100 });
+
+    await Promise.all([
+      joinRandomChat(env, message(man, 350, "👧 دختر"), man, "woman"),
+      joinRandomChat(env, message(woman, 351, "👦 پسر"), woman, "man")
+    ]);
+
+    const sessions = await env.CRASH_BOT_DB.prepare(`
+      SELECT id, user_a_id, user_b_id, status FROM anonymous_sessions
+      WHERE user_a_id IN (?, ?) OR user_b_id IN (?, ?)
+    `).bind(man, woman, man, woman).all();
+    sessions.results.forEach((row) => fixtureSessions.add(row.id));
+    const members = await env.CRASH_BOT_DB.prepare(`
+      SELECT user_id, session_id FROM anonymous_chat_members
+      WHERE user_id IN (?, ?)
+    `).bind(man, woman).all();
+    expect(sessions.results).toHaveLength(1);
+    expect(sessions.results[0].status).toBe("active");
+    expect(new Set([sessions.results[0].user_a_id, sessions.results[0].user_b_id]))
+      .toEqual(new Set([man, woman]));
+    expect(members.results).toHaveLength(2);
+    expect(new Set(members.results.map((row) => row.user_id)))
+      .toEqual(new Set([man, woman]));
+  });
+
+  it("leaves the waiting queue on navigation and ignores callbacks from the cancelled search", async () => {
+    const user = await createUser("man");
+    vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+
+    await joinRandomChat(env, message(user, 360, "👧 دختر"), user, "woman");
+    let session = await env.CRASH_BOT_DB.prepare(`
+      SELECT id, status FROM anonymous_sessions WHERE user_a_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).bind(user).first();
+    fixtureSessions.add(session.id);
+    const cancelledSessionId = session.id;
+    await handleRandomChatMessage(
+      env, message(user, 361, "👤 پروفایل من"), user, "profile_home", "👤 پروفایل من"
+    );
+    expect((await env.CRASH_BOT_DB.prepare(
+      "SELECT status FROM anonymous_sessions WHERE id = ?"
+    ).bind(session.id).first()).status).toBe("cancelled");
+    expect((await env.CRASH_BOT_DB.prepare(
+      "SELECT COUNT(*) AS count FROM anonymous_chat_members WHERE user_id = ?"
+    ).bind(user).first()).count).toBe(0);
+
+    await joinRandomChat(env, message(user, 362, "👧 دختر"), user, "woman");
+    session = await env.CRASH_BOT_DB.prepare(`
+      SELECT id, status FROM anonymous_sessions WHERE user_a_id = ?
+      ORDER BY id DESC LIMIT 1
+    `).bind(user).first();
+    fixtureSessions.add(session.id);
+    await handleRandomChatCallback(
+      env, callback(user, `random:cancel:${cancelledSessionId}`)
+    );
+    expect((await env.CRASH_BOT_DB.prepare(
+      "SELECT status FROM anonymous_sessions WHERE id = ?"
+    ).bind(session.id).first()).status).toBe("waiting");
+  });
+
   it("ends once for concurrent participants, rejects stale controls, and allows a new search", async () => {
     const first = await createUser("man");
     const second = await createUser("woman");
@@ -238,14 +306,27 @@ describe("random anonymous chat", () => {
     const first = await createUser("man");
     const second = await createUser("woman");
     const sessionId = await activeSession(first, second, "woman");
-    const delivery = vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
+    const delivery = vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
       .mockResolvedValue({ outcome: "sent", messageId: 900 });
     vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
 
     await handleRandomChatMessage(env, message(first, 601, "hello"), first);
     await handleRandomChatMessage(env, message(first, 601, "hello"), first);
-    expect(delivery).toHaveBeenCalledTimes(1);
-    expect(delivery).toHaveBeenCalledWith(env, second, "hello");
+    expect(delivery).toHaveBeenCalledTimes(3);
+    expect(delivery).toHaveBeenCalledWith(
+      env,
+      second,
+      expect.stringContaining("منبع: چت ناشناس تصادفی"),
+      [[expect.objectContaining({ text: "مشاهده پیام" })]]
+    );
+    expect(delivery).toHaveBeenCalledWith(
+      env,
+      first,
+      expect.stringContaining("پیام در تاریخچهٔ گفت‌وگو ثبت شد"),
+      [[expect.objectContaining({ callback_data: expect.stringMatching(/^anon:history:/) })]],
+      null,
+      601
+    );
     const saved = await env.CRASH_BOT_DB.prepare(`
       SELECT sender_id, recipient_id, message_type, session_id, delivery_status
       FROM anonymous_messages WHERE source_message_id = ? AND message_type = 'random_chat'
@@ -269,7 +350,7 @@ describe("random anonymous chat", () => {
     const second = await createUser("woman");
     await activeSession(first, second, "woman");
     await setPostConversation(env, first, "connection_chat", 1);
-    const delivery = vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
+    const delivery = vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
       .mockResolvedValue({ outcome: "sent", messageId: 901 });
     vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
 

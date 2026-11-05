@@ -143,8 +143,7 @@ async function startSettingEdit(env, ownerId, chatId, key) {
   const sent = await sendTrackedSectionNoticeTelegram(
     env,
     chatId,
-    `مقدار جدید برای «${setting.label}» را بفرست. مقدار خالی پذیرفته نیست. برای لغو «لغو» بنویس.`,
-    []
+    `مقدار جدید برای «${setting.label}» را بفرست. مقدار خالی پذیرفته نیست. برای لغو «لغو» بنویس.`
   );
   if (!sent) throw new Error("Could not start settings edit");
   return true;
@@ -174,8 +173,7 @@ export async function handleSettingsMessage(env, message, ownerId, isNavigation 
     await sendTrackedSectionNoticeTelegram(
       env,
       message.chat.id,
-      `مقدار برای «${setting?.label ?? "تنظیم"}» نامعتبر است. مقدار قبلی تغییر نکرده؛ مقدار معتبر دیگری بفرست یا «لغو» بنویس.`,
-      []
+      `مقدار برای «${setting?.label ?? "تنظیم"}» نامعتبر است. مقدار قبلی تغییر نکرده؛ مقدار معتبر دیگری بفرست یا «لغو» بنویس.`
     );
     return true;
   }

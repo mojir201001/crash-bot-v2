@@ -16,12 +16,26 @@ import {
   saveUserWorkflow,
   validateProfileField
 } from "./profile.js";
-import { sendTrackedSectionNoticeTelegram } from "../telegram/api.js";
+import {
+  sendMediaTelegramDetailed,
+  sendTrackedSectionNoticeTelegram
+} from "../telegram/api.js";
 import { adminMenu, stage3Routes, userMenu } from "../telegram/keyboards.js";
+import { conversationMediaFromMessage } from "./conversation-engine.js";
 
 const MAIN_MENU_TEXT = "🏠 منوی اصلی";
 const INTERESTS_LATER_TEXT = "بعداً تکمیل می‌کنم";
 const INTERESTS_PAGE_SIZE = 8;
+const INTEREST_MEDIA_METHODS = {
+  photo: "sendPhoto",
+  video: "sendVideo",
+  document: "sendDocument",
+  audio: "sendAudio",
+  voice: "sendVoice",
+  animation: "sendAnimation",
+  video_note: "sendVideoNote",
+  sticker: "sendSticker"
+};
 const interestFlowControls = new Set([
   "➕ افزودن علاقه‌مندی",
   "⬅️ علایق قبلی",
@@ -72,7 +86,7 @@ const prompts = {
   image_file_id: "یک عکس بفرست یا «بدون عکس» را انتخاب کن. این عکس فقط برای پروفایل ربات استفاده می‌شود."
 };
 
-function rowsForField(field) {
+function rowsForField(field, onboarding = false) {
   if (field === "birth_month") {
     const rows = [];
     for (let index = 0; index < PERSIAN_MONTHS.length; index += 3) {
@@ -87,7 +101,9 @@ function rowsForField(field) {
     return [[{ text: "زن" }, { text: "مرد" }]];
   }
   if (field === "image_file_id") {
-    return [[{ text: "بدون عکس" }]];
+    const rows = [[{ text: "بدون عکس" }]];
+    if (!onboarding) rows.push([{ text: "↩️ بازگشت به پروفایل" }]);
+    return rows;
   }
   return [];
 }
@@ -101,18 +117,7 @@ function categoryRows(categories = INTEREST_CATEGORIES) {
 }
 
 function mediaFromMessage(message) {
-  const photo = Array.isArray(message?.photo) ? message.photo.at(-1) : null;
-  if (photo?.file_id) return { type: "photo", fileId: photo.file_id };
-
-  for (const type of [
-    "video", "document", "audio", "voice", "animation", "video_note", "sticker"
-  ]) {
-    if (message?.[type]?.file_id) {
-      return { type, fileId: message[type].file_id };
-    }
-  }
-
-  return null;
+  return conversationMediaFromMessage(message);
 }
 
 function textFromMessage(message) {
@@ -123,8 +128,14 @@ function persianNumber(value) {
   return Number(value).toLocaleString("fa-IR");
 }
 
-async function sendScreen(env, chatId, text, keyboard = []) {
-  const sent = await sendTrackedSectionNoticeTelegram(env, chatId, text, keyboard);
+async function sendScreen(env, chatId, text, keyboard = null) {
+  const rows = Array.isArray(keyboard) && keyboard.length ? [...keyboard] : null;
+  if (rows && !rows.some((row) =>
+    row.some((button) => button.text === MAIN_MENU_TEXT)
+  )) {
+    rows.push([{ text: MAIN_MENU_TEXT }]);
+  }
+  const sent = await sendTrackedSectionNoticeTelegram(env, chatId, text, rows);
   if (!sent) throw new Error("Could not send the profile workflow screen");
 }
 
@@ -145,7 +156,13 @@ async function showFieldPrompt(env, chatId, userId, field, onboarding) {
   const prefix = onboarding
     ? `📝 تکمیل پروفایل — ${profileFieldLabel(field)} اجباری است.\n\n`
     : `✏️ ویرایش ${profileFieldLabel(field)}\n\n`;
-  await sendScreen(env, chatId, `${prefix}${prompts[field]}`, rowsForField(field));
+  const rows = rowsForField(field, onboarding);
+  if (!rows.length) {
+    rows.push([{
+      text: onboarding ? MAIN_MENU_TEXT : "↩️ بازگشت به ویرایش اطلاعات"
+    }]);
+  }
+  await sendScreen(env, chatId, `${prefix}${prompts[field]}`, rows);
 }
 
 async function showProfile(env, chatId, userId) {
@@ -180,6 +197,16 @@ async function showProfile(env, chatId, userId) {
     [{ text: "✏️ ویرایش اطلاعات" }, { text: "❤️ علاقه‌مندی‌های من" }],
     [{ text: MAIN_MENU_TEXT }]
   ]);
+  if (profile.image_file_id) {
+    const result = await sendMediaTelegramDetailed(env, "sendPhoto", {
+      chat_id: chatId,
+      photo: profile.image_file_id,
+      caption: "عکس پروفایل مخصوص ربات"
+    });
+    if (result.outcome !== "sent") {
+      console.error("Could not display the user's profile photo:", result.outcome);
+    }
+  }
 }
 
 async function showEditMenu(env, chatId, userId) {
@@ -224,6 +251,25 @@ async function showInterests(env, chatId, userId, page = 0) {
     `❤️ علاقه‌مندی‌های من (${persianNumber(total)})\n\n${lines.join("\n")}`,
     rows
   );
+  for (const interest of visible) {
+    const method = INTEREST_MEDIA_METHODS[interest.media_type];
+    if (!method || !interest.media_file_id) continue;
+    const captionText = [
+      `❤️ ${interest.category}`,
+      interest.caption || interest.content || ""
+    ].filter(Boolean).join("\n");
+    const noCaption = ["sticker", "video_note"].includes(interest.media_type);
+    const result = await sendMediaTelegramDetailed(env, method, {
+      chat_id: chatId,
+      [interest.media_type]: interest.media_file_id,
+      ...(!noCaption && captionText
+        ? { caption: Array.from(captionText).slice(0, 1024).join("") }
+        : {})
+    });
+    if (result.outcome !== "sent") {
+      console.error(`Could not display interest media #${interest.id}:`, result.outcome);
+    }
+  }
 }
 
 async function beginInterests(env, chatId, userId) {
@@ -317,6 +363,10 @@ async function handleProfileField(env, message, userId, workflow) {
   const text = textFromMessage(message);
 
   if (field === "image_file_id") {
+    if (text === "↩️ بازگشت به پروفایل" && !onboarding) {
+      await showProfile(env, chatId, userId);
+      return true;
+    }
     if (text === "بدون عکس") {
       if (onboarding) await showInterestsOffer(env, chatId, userId);
       else {
@@ -331,7 +381,7 @@ async function handleProfileField(env, message, userId, workflow) {
       : null;
     const imageFileId = image?.file_id ?? document?.file_id;
     if (!imageFileId) {
-      await sendScreen(env, chatId, `${prompts.image_file_id}\n\nفقط عکس یا فایل تصویری پذیرفته می‌شود.`, rowsForField(field));
+      await sendScreen(env, chatId, `${prompts.image_file_id}\n\nفقط عکس یا فایل تصویری پذیرفته می‌شود.`, rowsForField(field, onboarding));
       return true;
     }
     await saveProfileField(env, userId, "image_file_id", imageFileId);
@@ -341,13 +391,13 @@ async function handleProfileField(env, message, userId, workflow) {
   }
 
   if (!text) {
-    await sendScreen(env, chatId, `${prompts[field]}\n\nبرای این فیلد، متن یا گزینهٔ مناسب را بفرست.`, rowsForField(field));
+    await sendScreen(env, chatId, `${prompts[field]}\n\nبرای این فیلد، متن یا گزینهٔ مناسب را بفرست.`, rowsForField(field, onboarding));
     return true;
   }
 
   const validation = validateProfileField(field, text);
   if (!validation.ok) {
-    await sendScreen(env, chatId, `${validation.error}\n\n${prompts[field]}`, rowsForField(field));
+    await sendScreen(env, chatId, `${validation.error}\n\n${prompts[field]}`, rowsForField(field, onboarding));
     return true;
   }
   await saveProfileField(env, userId, field, text);
@@ -491,7 +541,9 @@ async function handleInterestWorkflow(env, message, userId, workflow) {
       stage: "content",
       payload: { category }
     });
-    await sendScreen(env, chatId, `متن یا رسانهٔ مربوط به «${category}» را بفرست.`);
+    await sendScreen(env, chatId, `متن یا رسانهٔ مربوط به «${category}» را بفرست.`, [
+      [{ text: "↩️ بازگشت به پروفایل" }]
+    ]);
     return true;
   }
 

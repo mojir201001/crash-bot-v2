@@ -472,15 +472,20 @@ export async function handlePostConversation(env, message, userId) {
   return true;
 }
 
-async function sendQueueCard(env, chatId, item, owner) {
+function queueCardText(item, owner) {
   const senderDetail = owner
-    ? `\nشناسهٔ تلگرام: ${item.sender_id}\nنام کاربری: ${item.sender_username ? `@${HTML(item.sender_username)}` : ""}`
+    ? `\nشناسهٔ تلگرام: ${item.sender_id}\nآیدی تلگرام: ${item.sender_username ? `@${HTML(item.sender_username)}` : "ثبت نشده"}\nلقب ربات: ${HTML(item.nickname || "ثبت نشده")}`
     : "";
   const content = item.caption ?? item.content ?? "";
   const reply = item.reply_to_post_id
     ? `\nپاسخ به پیام داخلی #${item.reply_to_post_id}`
     : "";
-  const text = `🆕 مورد صف مدیریت #${item.queue_id}\nنوع: ${item.reply_to_post_id ? "پاسخ" : (item.media_type ?? "متن")}\nدریافت: ${item.created_at} UTC${reply}${senderDetail}\n\n${HTML(content)}`;
+  return `🆕 مورد صف مدیریت #${item.queue_id}\nشماره رکورد فرستنده: ${item.user_record_number ?? "نامشخص"}\nنوع: ${item.reply_to_post_id ? "پاسخ" : (item.media_type ?? "متن")}\nدریافت: ${formatArchiveDate(item.created_at)}${reply}${senderDetail}\n\n${HTML(content)}`;
+}
+
+async function sendQueueCard(env, chatId, item, owner) {
+  const content = item.caption ?? item.content ?? "";
+  const text = queueCardText(item, owner);
   if (item.media_file_id) {
     await sendMediaTelegram(env, telegramMethod(item.media_type), {
       chat_id: chatId,
@@ -499,8 +504,10 @@ async function sendQueueCard(env, chatId, item, owner) {
 export async function notifyModerators(env, queueId) {
   const item = await env.CRASH_BOT_DB.prepare(`
     SELECT q.id AS queue_id, q.sender_id, p.sender_username, p.content, p.caption,
-      p.media_type, p.media_file_id, p.reply_to_post_id, q.created_at
+      p.media_type, p.media_file_id, p.reply_to_post_id, p.user_record_number,
+      pr.nickname, q.created_at
     FROM admin_queue q JOIN posts p ON p.id = q.item_id
+    LEFT JOIN profiles pr ON pr.user_id = p.user_id
     WHERE q.id = ? AND q.status = 'pending'
   `).bind(queueId).first();
   if (!item) return;
@@ -524,8 +531,10 @@ async function loadQueueItem(env, queueId) {
   return env.CRASH_BOT_DB.prepare(`
     SELECT q.id AS queue_id, q.item_id, q.item_type, q.sender_id, q.status AS queue_status,
       q.created_at, p.user_id, p.content, p.caption, p.media_type, p.media_file_id,
-      p.reply_to_post_id, p.status AS post_status, p.sender_username, p.channel_message_id
+      p.reply_to_post_id, p.status AS post_status, p.sender_username, p.channel_message_id,
+      p.user_record_number, pr.nickname
     FROM admin_queue q JOIN posts p ON p.id = q.item_id
+    LEFT JOIN profiles pr ON pr.user_id = p.user_id
     WHERE q.id = ?
   `).bind(queueId).first();
 }
@@ -667,6 +676,20 @@ export async function handlePostCallback(env, query) {
     return true;
   }
   if (action === "cancel") {
+    const confirmations = await Promise.all([
+      env.CRASH_BOT_DB.prepare(`
+        SELECT queue_id FROM moderation_confirmations
+        WHERE actor_id = ? AND queue_id = ?
+      `).bind(actorId, id).first(),
+      env.CRASH_BOT_DB.prepare(`
+        SELECT post_id FROM owner_repost_confirmations
+        WHERE actor_id = ? AND post_id = ?
+      `).bind(actorId, id).first(),
+      env.CRASH_BOT_DB.prepare(`
+        SELECT post_id FROM owner_publication_confirmations
+        WHERE actor_id = ? AND post_id = ?
+      `).bind(actorId, id).first()
+    ]);
     await env.CRASH_BOT_DB.prepare(`
       DELETE FROM moderation_confirmations WHERE actor_id = ? AND queue_id = ?
     `).bind(actorId, id).run();
@@ -676,8 +699,47 @@ export async function handlePostCallback(env, query) {
     await env.CRASH_BOT_DB.prepare(`
       DELETE FROM owner_publication_confirmations WHERE actor_id = ? AND post_id = ?
     `).bind(actorId, id).run();
+    let restoredKeyboard = [];
+    let restoredText = `گزینه‌های عملیاتی مورد #${id}:`;
+    if (confirmations[0]) {
+      const item = await loadQueueItem(env, id);
+      if (item?.queue_status === "pending" && item.post_status === "pending") {
+        restoredKeyboard = [[
+          { text: "✅ تأیید", callback_data: `post:review:${id}:approved` },
+          { text: "❌ رد", callback_data: `post:review:${id}:rejected` }
+        ]];
+        restoredText = queueCardText(item, role === "owner");
+      }
+    } else if (confirmations[1]) {
+      const post = await env.CRASH_BOT_DB.prepare(
+        "SELECT status FROM posts WHERE id = ?"
+      ).bind(id).first();
+      if (post?.status === "rejected") {
+        restoredKeyboard = [[{
+          text: "انتشار مجدد",
+          callback_data: `post:repost:${id}`
+        }]];
+      }
+    } else if (confirmations[2]) {
+      const job = await env.CRASH_BOT_DB.prepare(`
+        SELECT j.status FROM publication_jobs j
+        WHERE j.item_id = ? AND j.item_type = (
+          SELECT CASE WHEN reply_to_post_id IS NULL THEN 'post' ELSE 'reply' END
+          FROM posts WHERE id = ?
+        ) ORDER BY j.id DESC LIMIT 1
+      `).bind(id, id).first();
+      const post = await env.CRASH_BOT_DB.prepare(
+        "SELECT status FROM posts WHERE id = ?"
+      ).bind(id).first();
+      if (post?.status === "approved" && ["failed", "unknown"].includes(job?.status)) {
+        restoredKeyboard = [[{
+          text: "بازیابی انتشار",
+          callback_data: `post:recover:${id}`
+        }]];
+      }
+    }
     await editInlineTelegram(env, query.message.chat.id, query.message.message_id,
-      `بررسی مورد #${id} لغو شد.`, []);
+      restoredText, restoredKeyboard, confirmations[0] ? "HTML" : null);
     await answerCallbackQuery(env, query.id, "لغو شد.");
     return true;
   }
@@ -857,6 +919,24 @@ export async function handlePostCallback(env, query) {
 }
 
 export async function handlePostHistoryCallback(env, query) {
+  const pageMatch = /^post:user-history:(\d+)$/.exec(query.data ?? "");
+  if (pageMatch) {
+    if (String(query.message?.chat?.id) !== String(query.from?.id)) {
+      await answerCallbackQuery(env, query.id, "این سابقه فقط در گفت‌وگوی خصوصی ربات در دسترس است.");
+      return true;
+    }
+    const page = Number(pageMatch[1]);
+    if (!Number.isSafeInteger(page) || page < 0 ||
+        !Number.isSafeInteger(page * USER_POSTS_PAGE_SIZE)) {
+      await answerCallbackQuery(env, query.id, "شمارهٔ صفحهٔ سابقه معتبر نیست.");
+      return true;
+    }
+    await answerCallbackQuery(env, query.id);
+    await renderUserPostsPage(
+      env, query.from.id, query.message.chat.id, page, query.message.message_id
+    );
+    return true;
+  }
   const match = /^post:history:(\d+)$/.exec(query.data ?? "");
   if (!match) return false;
   if (String(query.message?.chat?.id) !== String(query.from?.id)) {
@@ -867,7 +947,8 @@ export async function handlePostHistoryCallback(env, query) {
   const role = await getUserRole(env, query.from?.id);
   const post = await env.CRASH_BOT_DB.prepare(`
     SELECT id, user_id, content, caption, media_type, media_file_id, status, created_at,
-    reviewed_at, reviewed_by, admin_note, sender_username, channel_message_id
+    reviewed_at, reviewed_by, admin_note, sender_username, channel_message_id,
+    user_record_number
   FROM posts WHERE id = ?
   `).bind(postId).first();
   const owner = role === "owner";
@@ -888,7 +969,7 @@ export async function handlePostHistoryCallback(env, query) {
   await answerCallbackQuery(env, query.id);
   if (post.media_file_id) await sendStoredMedia(env, query.message.chat.id, post);
   await sendTelegram(env, query.message.chat.id,
-    `🗂 سابقهٔ ثبت کراش #${post.id}\nوضعیت مدیریتی: ${post.status}\nنتیجهٔ انتشار: ${job?.status ?? "ثبت نشده"}\nتاریخ دریافت: ${post.created_at} UTC\nتاریخ اقدام: ${post.reviewed_at ? `${post.reviewed_at} UTC` : "—"}${owner ? `\nفرستنده: ${post.user_id}\nنام کاربری: ${post.sender_username ? `@${post.sender_username}` : ""}\nمدیر اقدام‌کننده: ${post.reviewed_by ?? ""}\nشناسهٔ پیام کانال: ${post.channel_message_id ?? ""}` : ""}${post.admin_note ? `\nتوضیح مدیر: ${post.admin_note}` : ""}\n\n${post.caption ?? post.content}`);
+    `🗂 سابقهٔ ثبت کراش #${post.user_record_number ?? "نامشخص"}\nوضعیت مدیریتی: ${post.status}\nنتیجهٔ انتشار: ${job?.status ?? "ثبت نشده"}\nتاریخ دریافت: ${formatArchiveDate(post.created_at)}\nتاریخ اقدام: ${post.reviewed_at ? formatArchiveDate(post.reviewed_at) : "—"}${owner ? `\nفرستنده: ${post.user_id}\nنام کاربری: ${post.sender_username ? `@${post.sender_username}` : ""}\nمدیر اقدام‌کننده: ${post.reviewed_by ?? ""}\nشناسهٔ پیام کانال: ${post.channel_message_id ?? ""}` : ""}${post.admin_note ? `\nتوضیح مدیر: ${post.admin_note}` : ""}\n\n${post.caption ?? post.content}`);
   if (post.status === "rejected" && owner) {
     await sendInlineTelegram(env, query.message.chat.id, "گزینه‌های مالک:", [[{
       text: "انتشار مجدد",
@@ -901,8 +982,10 @@ export async function handlePostHistoryCallback(env, query) {
 export async function renderPendingQueue(env, chatId) {
   const rows = await env.CRASH_BOT_DB.prepare(`
     SELECT q.id AS queue_id, q.sender_id, p.sender_username, p.content, p.caption,
-      p.media_type, p.media_file_id, p.reply_to_post_id, q.created_at
+      p.media_type, p.media_file_id, p.reply_to_post_id, p.user_record_number,
+      pr.nickname, q.created_at
     FROM admin_queue q JOIN posts p ON p.id = q.item_id
+    LEFT JOIN profiles pr ON pr.user_id = p.user_id
     WHERE q.status = 'pending'
     ORDER BY q.created_at ASC, q.id ASC LIMIT 10
   `).all();
@@ -932,9 +1015,68 @@ const archiveDateFormatter = new Intl.DateTimeFormat(
 );
 
 function formatArchiveDate(value) {
-  const utc = new Date(`${String(value).replace(" ", "T")}Z`);
+  const input = String(value ?? "");
+  const utc = new Date(/[zZ]|[+-]\d\d:\d\d$/.test(input)
+    ? input
+    : `${input.replace(" ", "T")}Z`);
   if (Number.isNaN(utc.getTime())) return String(value);
   return archiveDateFormatter.format(utc);
+}
+
+const USER_POSTS_PAGE_SIZE = 10;
+
+async function renderUserPostsPage(env, userId, chatId, page, messageId = null) {
+  const total = Number((await env.CRASH_BOT_DB.prepare(`
+    SELECT COUNT(*) AS count FROM posts WHERE user_id = ?
+  `).bind(userId).first())?.count ?? 0);
+  const pageCount = Math.max(1, Math.ceil(total / USER_POSTS_PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount - 1);
+  const rows = await env.CRASH_BOT_DB.prepare(`
+    SELECT p.id, p.user_record_number, p.content, p.caption, p.media_type, p.media_file_id,
+      p.status, p.created_at, j.status AS publication_status
+    FROM posts p LEFT JOIN publication_jobs j ON j.item_id = p.id
+      AND j.item_type = CASE WHEN p.reply_to_post_id IS NULL THEN 'post' ELSE 'reply' END
+    WHERE p.user_id = ?
+    ORDER BY p.created_at DESC, p.id DESC
+    LIMIT ? OFFSET ?
+  `).bind(userId, USER_POSTS_PAGE_SIZE, currentPage * USER_POSTS_PAGE_SIZE).all();
+  const items = rows.results ?? [];
+  const lines = items.length
+    ? items.map((post) => {
+      const excerpt = String(post.caption ?? post.content ?? "")
+        .replace(/\s+/g, " ").slice(0, 130);
+      return `#${post.user_record_number ?? "نامشخص"} · وضعیت: ${post.status} · انتشار: ${post.publication_status ?? "ثبت‌نشده"}\n${formatArchiveDate(post.created_at)}\n${excerpt}`;
+    })
+    : ["هنوز موردی برای نمایش در سابقهٔ شما ثبت نشده است."];
+  const keyboard = items.map((post) => [{
+    text: `جزئیات #${post.user_record_number ?? "نامشخص"}`,
+    callback_data: `post:history:${post.id}`
+  }]);
+  if (currentPage > 0 || currentPage + 1 < pageCount) {
+    const navigation = [];
+    if (currentPage > 0) {
+      navigation.push({
+        text: "صفحهٔ قبلی",
+        callback_data: `post:user-history:${currentPage - 1}`
+      });
+    }
+    if (currentPage + 1 < pageCount) {
+      navigation.push({
+        text: "صفحهٔ بعدی",
+        callback_data: `post:user-history:${currentPage + 1}`
+      });
+    }
+    keyboard.push(navigation);
+  }
+  const text = `📚 سابقهٔ ثبت کراش‌های شما · ${total} مورد · صفحه ${currentPage + 1}/${pageCount}\n\n${lines.join("\n\n")}`.slice(0, 4096);
+  if (messageId) {
+    await editInlineTelegram(env, chatId, messageId, text, keyboard);
+  } else {
+    await sendInlineTelegram(env, chatId, text, keyboard);
+  }
+  for (const post of items) {
+    if (post.media_file_id) await sendStoredMedia(env, chatId, post);
+  }
 }
 
 async function archiveRole(env, actorId, chatId) {
@@ -943,7 +1085,7 @@ async function archiveRole(env, actorId, chatId) {
   return canAccess(role, "message_archive") ? role : null;
 }
 
-async function renderArchiveYears(env, chatId, actorId) {
+async function renderArchiveYears(env, chatId, actorId, messageId = null) {
   const role = await archiveRole(env, actorId, chatId);
   if (!role) {
     await sendTelegram(env, chatId, "برای دسترسی به آرشیو مجوز مدیریت لازم است.");
@@ -970,10 +1112,12 @@ async function renderArchiveYears(env, chatId, actorId) {
     })));
   }
   rows.push([{ text: "🗂 آرشیو کلی", callback_data: "archive:all:0" }]);
-  await sendInlineTelegram(env, chatId, "🗂 سال آرشیو را انتخاب کن.", rows);
+  const text = "🗂 سال آرشیو را انتخاب کن.";
+  if (messageId) await editInlineTelegram(env, chatId, messageId, text, rows);
+  else await sendInlineTelegram(env, chatId, text, rows);
 }
 
-async function renderArchiveMonths(env, chatId, actorId, year) {
+async function renderArchiveMonths(env, chatId, actorId, year, messageId = null) {
   const role = await archiveRole(env, actorId, chatId);
   if (!role || !Number.isInteger(year) ||
       year < 1300 || year > getCurrentPersianYear()) {
@@ -989,20 +1133,23 @@ async function renderArchiveMonths(env, chatId, actorId, year) {
   }
   rows.push([{ text: "↩️ انتخاب سال", callback_data: "archive:years" }]);
   rows.push([{ text: "🗂 آرشیو کلی", callback_data: "archive:all:0" }]);
-  await sendInlineTelegram(env, chatId, `🗂 سال ${year} · ماه را انتخاب کن.`, rows);
+  const text = `🗂 سال ${year} · ماه را انتخاب کن.`;
+  if (messageId) await editInlineTelegram(env, chatId, messageId, text, rows);
+  else await sendInlineTelegram(env, chatId, text, rows);
 }
 
-async function renderArchivePage(env, chatId, actorId, period, page) {
+async function renderArchivePage(env, chatId, actorId, period, page, messageId = null) {
   const role = await archiveRole(env, actorId, chatId);
   if (!role) {
     await sendTelegram(env, chatId, "برای دسترسی به آرشیو مجوز مدیریت لازم است.");
     return;
   }
-  if (!Number.isSafeInteger(page) || page < 0 || page > 100000) {
+  if (!Number.isSafeInteger(page) || page < 0 ||
+      !Number.isSafeInteger(page * ARCHIVE_PAGE_SIZE)) {
     await sendTelegram(env, chatId, "شمارهٔ صفحهٔ آرشیو معتبر نیست.");
     return;
   }
-  const conditions = [];
+  const conditions = ["p.status != 'pending'"];
   const bindings = [];
   if (period) {
     let range;
@@ -1022,7 +1169,7 @@ async function renderArchivePage(env, chatId, actorId, period, page) {
   const pageCount = Math.max(1, Math.ceil(total / ARCHIVE_PAGE_SIZE));
   const currentPage = Math.min(page, pageCount - 1);
   const posts = await env.CRASH_BOT_DB.prepare(`
-    SELECT p.id, p.content, p.caption, p.media_type, p.media_file_id,
+    SELECT p.id, p.user_record_number, p.content, p.caption, p.media_type, p.media_file_id,
       p.status, p.created_at, p.reviewed_at, p.reply_to_post_id,
       j.status AS publication_status
     FROM posts p
@@ -1045,12 +1192,12 @@ async function renderArchivePage(env, chatId, actorId, period, page) {
         .replace(/\s+/g, " ").slice(0, 130);
       const kind = post.reply_to_post_id ? `پاسخ به #${post.reply_to_post_id}` :
         (post.media_type ? `رسانه: ${post.media_type}` : "متن");
-      return `#${post.id} · ${post.status} · انتشار: ${post.publication_status ?? "ثبت‌نشده"}\n${formatArchiveDate(post.created_at)} · ${kind}\n${excerpt}`;
+      return `#${post.user_record_number ?? "نامشخص"} · ${post.status} · انتشار: ${post.publication_status ?? "ثبت‌نشده"}\n${formatArchiveDate(post.created_at)} · ${kind}\n${excerpt}`;
     })
     : ["در این بازه پیامی ثبت نشده است."];
   const keyboard = items.map((post) => {
     const actions = [{
-      text: `جزئیات و سابقهٔ #${post.id}`,
+      text: `جزئیات و سابقهٔ #${post.user_record_number ?? "نامشخص"}`,
       callback_data: `post:history:${post.id}`
     }];
     if (role === "owner" && post.status === "rejected") {
@@ -1093,12 +1240,9 @@ async function renderArchivePage(env, chatId, actorId, period, page) {
   }
   keyboard.push([{ text: "↩️ انتخاب سال", callback_data: "archive:years" }]);
   keyboard.push([{ text: "🗂 آرشیو کلی", callback_data: "archive:all:0" }]);
-  await sendInlineTelegram(
-    env,
-    chatId,
-    `🗂 آرشیو ${periodLabel} · ${total} مورد · صفحه ${currentPage + 1}/${pageCount}\n\n${lines.join("\n\n")}`.slice(0, 4096),
-    keyboard
-  );
+  const text = `🗂 آرشیو ${periodLabel} · ${total} مورد · صفحه ${currentPage + 1}/${pageCount}\n\n${lines.join("\n\n")}`.slice(0, 4096);
+  if (messageId) await editInlineTelegram(env, chatId, messageId, text, keyboard);
+  else await sendInlineTelegram(env, chatId, text, keyboard);
 }
 
 export async function renderPostArchive(env, chatId, actorId) {
@@ -1127,19 +1271,23 @@ export async function handleArchiveCallback(env, query) {
   }
   if (data === "archive:years") {
     await answerCallbackQuery(env, query.id);
-    await renderArchiveYears(env, chatId, actorId);
+    await renderArchiveYears(env, chatId, actorId, query.message?.message_id);
     return true;
   }
   const yearMatch = /^archive:year:(\d{4})$/.exec(data);
   if (yearMatch) {
     await answerCallbackQuery(env, query.id);
-    await renderArchiveMonths(env, chatId, actorId, Number(yearMatch[1]));
+    await renderArchiveMonths(
+      env, chatId, actorId, Number(yearMatch[1]), query.message?.message_id
+    );
     return true;
   }
   const allMatch = /^archive:all:(\d+)$/.exec(data);
   if (allMatch) {
     await answerCallbackQuery(env, query.id);
-    await renderArchivePage(env, chatId, actorId, null, Number(allMatch[1]));
+    await renderArchivePage(
+      env, chatId, actorId, null, Number(allMatch[1]), query.message?.message_id
+    );
     return true;
   }
   const monthMatch = /^archive:month:(\d{4}):(\d{1,2}):(\d+)$/.exec(data);
@@ -1148,7 +1296,7 @@ export async function handleArchiveCallback(env, query) {
     await renderArchivePage(env, chatId, actorId, {
       year: Number(monthMatch[1]),
       month: Number(monthMatch[2])
-    }, Number(monthMatch[3]));
+    }, Number(monthMatch[3]), query.message?.message_id);
     return true;
   }
   await answerCallbackQuery(env, query.id, "درخواست آرشیو معتبر نیست.");
@@ -1156,23 +1304,11 @@ export async function handleArchiveCallback(env, query) {
 }
 
 export async function listUserPosts(env, userId, chatId) {
-  const rows = await env.CRASH_BOT_DB.prepare(`
-    SELECT p.id, p.content, p.caption, p.media_type, p.media_file_id,
-      p.status, p.created_at, j.status AS publication_status
-    FROM posts p LEFT JOIN publication_jobs j ON j.item_id = p.id
-    AND j.item_type = CASE WHEN p.reply_to_post_id IS NULL THEN 'post' ELSE 'reply' END
-    WHERE p.user_id = ? ORDER BY p.created_at DESC, p.id DESC LIMIT 30
-  `).bind(userId).all();
-  if (!rows.results?.length) {
-    await sendTelegram(env, chatId, "هنوز موردی برای نمایش در سابقهٔ شما ثبت نشده است.");
+  if (String(userId) !== String(chatId)) {
+    await sendTelegram(env, chatId, "این سابقه فقط در گفت‌وگوی خصوصی شما در دسترس است.");
     return;
   }
-  for (const post of rows.results) {
-    if (post.media_file_id) await sendStoredMedia(env, chatId, post);
-    await sendInlineTelegram(env, chatId,
-      `#${post.id} · وضعیت: ${post.status} · انتشار: ${post.publication_status ?? "ثبت‌نشده"}\n${post.created_at}\n\n${post.caption ?? post.content}`,
-      [[{ text: "جزئیات", callback_data: `post:history:${post.id}` }]]);
-  }
+  await renderUserPostsPage(env, userId, chatId, 0);
 }
 
 export function escapeHtml(value) {

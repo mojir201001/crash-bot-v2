@@ -1,12 +1,18 @@
 async function telegramRequest(env, method, payload) {
-  const response = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    }
-  );
+  let response;
+  try {
+    response = await fetch(
+      `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }
+    );
+  } catch {
+    console.error(`Telegram ${method}: network failure`);
+    return { ok: false };
+  }
 
   let result;
 
@@ -43,15 +49,17 @@ async function telegramRequestDetailed(env, method, payload) {
         body: JSON.stringify(payload)
       }
     );
-  } catch (error) {
-    return { outcome: "unknown", error };
+  } catch {
+    console.error(`Telegram ${method}: network failure`);
+    return { outcome: "unknown" };
   }
 
   let result;
   try {
     result = await response.json();
-  } catch (error) {
-    return { outcome: "unknown", error };
+  } catch {
+    console.error(`Telegram ${method}: invalid response`);
+    return { outcome: "unknown" };
   }
   if (!response.ok || result?.ok !== true) {
     return {
@@ -60,6 +68,14 @@ async function telegramRequestDetailed(env, method, payload) {
     };
   }
   return { outcome: "sent", result: result.result };
+}
+
+function replyKeyboardMarkup(keyboard) {
+  if (keyboard === null || keyboard === undefined) return null;
+  if (!Array.isArray(keyboard)) return null;
+  return keyboard.length
+    ? { keyboard, resize_keyboard: true, is_persistent: false }
+    : { remove_keyboard: true };
 }
 
 export async function sendMediaTelegram(env, method, payload) {
@@ -118,15 +134,17 @@ export async function sendDocumentBytesDetailed(env, chatId, filename, bytes) {
     : { outcome: "unknown" };
 }
 
-export async function sendMessageTelegramDetailed(env, chatId, text, keyboard = null) {
+export async function sendMessageTelegramDetailed(
+  env, chatId, text, keyboard = null, replyToMessageId = null
+) {
+  const replyMarkup = replyKeyboardMarkup(keyboard);
   const result = await telegramRequestDetailed(env, "sendMessage", {
     chat_id: chatId,
     text,
-    ...(Array.isArray(keyboard) ? {
-      reply_markup: keyboard.length
-        ? { keyboard, resize_keyboard: true, is_persistent: false }
-        : { remove_keyboard: true }
-    } : {})
+    ...(Number.isSafeInteger(replyToMessageId) && replyToMessageId > 0
+      ? { reply_parameters: { message_id: replyToMessageId } }
+      : {}),
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
   });
   if (result.outcome !== "sent") return { outcome: result.outcome };
   return Number.isSafeInteger(result.result?.message_id)
@@ -135,12 +153,15 @@ export async function sendMessageTelegramDetailed(env, chatId, text, keyboard = 
 }
 
 export async function sendInlineTelegramDetailed(
-  env, chatId, text, inlineKeyboard, parseMode = null
+  env, chatId, text, inlineKeyboard, parseMode = null, replyToMessageId = null
 ) {
   const result = await telegramRequestDetailed(env, "sendMessage", {
     chat_id: chatId,
     text,
     ...(parseMode ? { parse_mode: parseMode } : {}),
+    ...(Number.isSafeInteger(replyToMessageId) && replyToMessageId > 0
+      ? { reply_parameters: { message_id: replyToMessageId } }
+      : {}),
     reply_markup: { inline_keyboard: inlineKeyboard }
   });
   if (result.outcome !== "sent") return { outcome: result.outcome };
@@ -155,16 +176,11 @@ export async function sendInlineTelegramDetailed(
  * that supplied a reply keyboard can disrupt navigation.
  */
 export async function sendTelegram(env, chatId, text, keyboard) {
+  const replyMarkup = replyKeyboardMarkup(keyboard);
   const result = await telegramRequest(env, "sendMessage", {
     chat_id: chatId,
     text,
-    ...(Array.isArray(keyboard) ? {
-      reply_markup: keyboard.length ? {
-        keyboard,
-        resize_keyboard: true,
-        is_persistent: false
-      } : { remove_keyboard: true }
-    } : {})
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
   });
 
   if (result?.ok !== true) {
@@ -182,21 +198,6 @@ export async function sendTelegram(env, chatId, text, keyboard) {
   if (isMainScreen && env?.CRASH_BOT_DB) {
     const settingKey = `ui_main_screen_message:${String(chatId)}`;
     const newMessageId = Number(result?.result?.message_id);
-    let previousMessageId = null;
-
-    try {
-      const row = await env.CRASH_BOT_DB
-        .prepare("SELECT value FROM bot_settings WHERE key = ?")
-        .bind(settingKey)
-        .first();
-
-      const oldId = Number(row?.value);
-      if (Number.isSafeInteger(oldId) && oldId > 0) {
-        previousMessageId = oldId;
-      }
-    } catch (error) {
-      console.error("Could not read previous main-screen message:", error);
-    }
 
     if (Number.isSafeInteger(newMessageId) && newMessageId > 0) {
       try {
@@ -207,14 +208,6 @@ export async function sendTelegram(env, chatId, text, keyboard) {
         `).bind(settingKey, String(newMessageId)).run();
       } catch (error) {
         console.error("Could not save new main-screen message:", error);
-      }
-
-      if (previousMessageId && previousMessageId !== newMessageId) {
-        try {
-          await deleteTelegramMessage(env, chatId, previousMessageId);
-        } catch (error) {
-          console.error("Could not delete previous main-screen message:", error);
-        }
       }
     }
   }
@@ -279,11 +272,13 @@ export async function editInlineTelegram(
 }
 
 
-const sectionScreenKey = (chatId) =>
+const replySectionScreenKey = (chatId) =>
   `ui_section_message:${String(chatId)}`;
+const inlineSectionScreenKey = (chatId) =>
+  `ui_inline_section_message:${String(chatId)}`;
 
 export async function clearTrackedSectionMessage(env, chatId) {
-  const key = sectionScreenKey(chatId);
+  const key = inlineSectionScreenKey(chatId);
 
   let row;
   try {
@@ -317,7 +312,7 @@ export async function clearTrackedSectionMessage(env, chatId) {
 export async function sendTrackedSectionInlineTelegram(
   env, chatId, text, inlineKeyboard
 ) {
-  const key = sectionScreenKey(chatId);
+  const key = inlineSectionScreenKey(chatId);
   let previousId = null;
 
   try {
@@ -368,35 +363,15 @@ export async function sendTrackedSectionInlineTelegram(
 
 // ??? ???? ???? ??? ???? ? ??? ???? ???? ??
 
-export async function sendTrackedSectionNoticeTelegram(env, chatId, text, keyboard) {
+export async function sendTrackedSectionNoticeTelegram(env, chatId, text, keyboard = null) {
   const db = env.CRASH_BOT_DB;
-  const settingKey = `ui_section_message:${String(chatId)}`;
-  let previousMessageId = null;
-
-  try {
-    const row = await db
-      .prepare("SELECT value FROM bot_settings WHERE key = ?")
-      .bind(settingKey)
-      .first();
-
-    const parsedId = Number(row?.value);
-    if (Number.isSafeInteger(parsedId) && parsedId > 0) {
-      previousMessageId = parsedId;
-    }
-  } catch (error) {
-    console.error("Could not read previous section message:", error);
-  }
+  const settingKey = replySectionScreenKey(chatId);
+  const replyMarkup = replyKeyboardMarkup(keyboard);
 
   const result = await telegramRequest(env, "sendMessage", {
     chat_id: chatId,
     text,
-    ...(Array.isArray(keyboard) ? {
-      reply_markup: keyboard.length ? {
-        keyboard,
-        resize_keyboard: true,
-        is_persistent: false
-      } : { remove_keyboard: true }
-    } : {})
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
   });
 
   if (result?.ok !== true) return false;
@@ -418,30 +393,11 @@ export async function sendTrackedSectionNoticeTelegram(env, chatId, text, keyboa
     console.error("Could not track new section message:", error);
   }
 
-  if (previousMessageId && previousMessageId !== newMessageId) {
-    try {
-      await deleteTelegramMessage(env, chatId, previousMessageId);
-    } catch (error) {
-      console.error("Could not delete previous section message:", error);
-    }
-  }
-
   return true;
 }
 export async function sendTrackedMainScreenTelegram(env, chatId, text, keyboard) {
   const db = env.CRASH_BOT_DB;
   const settingKey = `ui_main_screen_message:${chatId}`;
-  let previousMessageId = null;
-
-  try {
-    const row = await db
-      .prepare("SELECT value FROM bot_settings WHERE key = ?")
-      .bind(settingKey)
-      .first();
-    previousMessageId = row?.value ?? null;
-  } catch (error) {
-    console.error("?????? ???? ???? ??? ???? ?????? ???:", error);
-  }
 
   const response = await sendTelegram(env, chatId, text, keyboard);
   const newMessageId = response?.result?.message_id;
@@ -458,16 +414,6 @@ export async function sendTrackedMainScreenTelegram(env, chatId, text, keyboard)
       console.error("??? ???? ???? ??? ???? ?????? ???:", error);
     }
 
-    if (
-      previousMessageId &&
-      String(previousMessageId) !== String(newMessageId)
-    ) {
-      try {
-        await deleteTelegramMessage(env, chatId, Number(previousMessageId));
-      } catch (error) {
-        console.error("??? ???? ???? ??? ???? ?????? ???:", error);
-      }
-    }
   }
 
   return response;

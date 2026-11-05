@@ -1,15 +1,29 @@
 import {
   answerCallbackQuery,
-  sendMediaTelegramDetailed,
+  deleteTelegramMessage,
+  sendInlineTelegramDetailed,
   sendMessageTelegramDetailed,
   sendTrackedSectionInlineTelegram
 } from "../telegram/api.js";
+import {
+  conversationMediaFromMessage,
+  conversationMessageControls,
+  deliverClaimedConversationMessage,
+  sendConversationContent
+} from "./conversation-engine.js";
 import { calculatePersianAge } from "./profile.js";
+import { upsertTelegramUser } from "./telegram-users.js";
+import {
+  CHAT_RETURN_BUTTON,
+  CHAT_RETURN_KEYBOARD
+} from "./anonymous-chat.js";
 
 const PAGE_SIZE = 8;
 const MESSAGE_PAGE_SIZE = 8;
+const TIMELINE_MESSAGES_KEY_PREFIX = "advertising_timeline_messages:";
 const NAVIGATION_TEXTS = new Set([
   "/start", "/menu", "🏠 منوی اصلی", "⬅️ بازگشت",
+  CHAT_RETURN_BUTTON,
   "🛠 پنل مدیریت", "👤 پنل کاربر", "👤 پروفایل من", "💌 ثبت پست کراش",
   "🎭 چت ناشناس تصادفی", "🤝 درخواست‌های ارتباط از کانال",
   "📢 ثبت درخواست تبلیغات", "📖 راهنما و قوانین",
@@ -22,58 +36,45 @@ const NAVIGATION_TEXTS = new Set([
   "🎭 ارتباط ناشناس", "🏫 خرید ربات برای دانشگاه", "❓ راهنما",
   "📜 قوانین ربات", "👤 پنل کاربر", "↩️ بازگشت به پنل مدیریت"
 ]);
-const MEDIA_METHODS = {
-  photo: "sendPhoto",
-  video: "sendVideo",
-  document: "sendDocument",
-  audio: "sendAudio",
-  voice: "sendVoice",
-  animation: "sendAnimation",
-  video_note: "sendVideoNote",
-  sticker: "sendSticker"
-};
-
 function textFromMessage(message) {
   return String(message?.text ?? message?.caption ?? "").trim();
 }
 
 function mediaFromMessage(message) {
-  const photo = Array.isArray(message?.photo) ? message.photo.at(-1) : null;
-  if (photo?.file_id) return { type: "photo", fileId: photo.file_id };
-  for (const type of Object.keys(MEDIA_METHODS).filter((item) => item !== "photo")) {
-    if (message?.[type]?.file_id) {
-      return { type, fileId: message[type].file_id };
-    }
-  }
-  return null;
+  return conversationMediaFromMessage(message);
 }
 
 function validPage(value) {
-  return Number.isSafeInteger(value) && value >= 0 && value <= 10000;
+  return Number.isSafeInteger(value) && value >= 0 &&
+    Number.isSafeInteger(value * MESSAGE_PAGE_SIZE);
 }
 
-function formatMessage(message) {
-  const sender = message.sender_role === "owner" ? "پاسخ مالک" : "درخواست‌دهنده";
-  const content = message.caption || message.message || "";
-  const media = message.media_type ? `\n[رسانه: ${message.media_type}]` : "";
+function formatMessage(message, viewerId, ownerId) {
+  const sender = message.sender_role === "owner"
+    ? "پاسخ مالک"
+    : String(viewerId) === String(ownerId)
+      ? `درخواست‌دهنده · Telegram ID: ${message.sender_id}`
+      : "پیام ناشناس";
+  const hidden = String(message.sender_id) !== String(viewerId) &&
+    (message.visibility_status === "blocked" ||
+      message.view_delivery_status !== "sent");
+  const content = hidden
+    ? message.visibility_status === "blocked"
+      ? "محتوای پیام تا خروج از بلاک و تأیید شما مخفی است."
+      : "برای مشاهدهٔ محتوای پیام، دکمهٔ مشاهده را بزنید."
+    : message.caption || message.message || "";
+  const media = hidden
+    ? ""
+    : message.media_type ? `\n[رسانه: ${message.media_type}]` : "";
+  const reply = message.reply_to_message_id
+    ? `\n↪️ پاسخ به پیام #${message.reply_to_message_id}`
+    : "";
   const delivery = message.delivery_status === "unknown"
     ? "\nوضعیت ارسال: نامشخص؛ ارسال دوباره انجام نشده است."
     : message.delivery_status === "failed"
       ? "\nوضعیت ارسال: ناموفق"
       : "";
-  return `${sender} — ${message.created_at}\n${content}${media}${delivery}`;
-}
-
-async function sendMedia(env, recipientId, media, caption) {
-  const method = MEDIA_METHODS[media.type];
-  if (!method) return { outcome: "rejected" };
-  return sendMediaTelegramDetailed(env, method, {
-    chat_id: recipientId,
-    [media.type]: media.fileId,
-    ...(caption && !["sticker", "video_note"].includes(media.type)
-      ? { caption: caption.slice(0, 1024) }
-      : {})
-  });
+  return `${sender} — ${message.created_at}\n${content}${media}${reply}${delivery}`;
 }
 
 async function saveActorState(env, actorId, conversationId, actorRole) {
@@ -84,6 +85,7 @@ async function saveActorState(env, actorId, conversationId, actorRole) {
     ON CONFLICT(actor_id) DO UPDATE SET
       conversation_id = excluded.conversation_id,
       actor_role = excluded.actor_role,
+      reply_to_message_id = NULL,
       updated_at = CURRENT_TIMESTAMP
   `).bind(actorId, conversationId, actorRole).run();
 }
@@ -107,32 +109,122 @@ async function ensureConversation(env, requesterId) {
   return conversation.id;
 }
 
-async function readConversationMessages(env, conversationId, page) {
+async function readConversationMessages(env, conversationId, page, actorId) {
   const messages = await env.CRASH_BOT_DB.prepare(`
-    SELECT id, sender_id, sender_role, message, media_type, media_file_id,
-           caption, delivery_status, created_at
-    FROM advertising_messages
-    WHERE conversation_id = ?
-    ORDER BY id DESC
+    SELECT m.id, m.sender_id, m.sender_role, m.message, m.media_type,
+           m.media_file_id, m.caption, m.delivery_status, m.visibility_status,
+           m.reply_to_message_id, m.view_delivery_status, m.created_at,
+           c.blocked_by
+    FROM advertising_messages m
+    JOIN advertising_conversations c ON c.id = m.conversation_id
+    WHERE m.conversation_id = ?
+      AND (m.sender_id = ? OR m.visibility_status IN ('visible', 'blocked'))
+    ORDER BY m.id DESC
     LIMIT ? OFFSET ?
   `).bind(
     conversationId,
-    MESSAGE_PAGE_SIZE,
+    actorId,
+    MESSAGE_PAGE_SIZE + 1,
     page * MESSAGE_PAGE_SIZE
   ).all();
-  return (messages.results ?? []).reverse();
+  const rows = messages.results ?? [];
+  return {
+    messages: rows.slice(0, MESSAGE_PAGE_SIZE).reverse(),
+    hasOlder: rows.length > MESSAGE_PAGE_SIZE
+  };
 }
 
-async function sendTimelineMedia(env, chatId, messages) {
+function timelineMessagesKey(chatId) {
+  return `${TIMELINE_MESSAGES_KEY_PREFIX}${String(chatId)}`;
+}
+
+async function readTimelineMessageIds(env, chatId) {
+  const row = await env.CRASH_BOT_DB.prepare(
+    "SELECT value FROM bot_settings WHERE key = ?"
+  ).bind(timelineMessagesKey(chatId)).first();
+  try {
+    const ids = JSON.parse(row?.value ?? "[]");
+    return Array.isArray(ids)
+      ? ids.filter((id) => Number.isSafeInteger(id) && id > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function clearTimelineMessages(env, chatId) {
+  const key = timelineMessagesKey(chatId);
+  const ids = await readTimelineMessageIds(env, chatId);
+  const remainingIds = [];
+  for (const id of ids) {
+    try {
+      if (!await deleteTelegramMessage(env, chatId, id)) remainingIds.push(id);
+    } catch {
+      remainingIds.push(id);
+    }
+  }
+  if (remainingIds.length) {
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO bot_settings (key, value)
+      VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).bind(key, JSON.stringify(remainingIds)).run();
+  } else {
+    await env.CRASH_BOT_DB.prepare(
+      "DELETE FROM bot_settings WHERE key = ?"
+    ).bind(key).run();
+  }
+}
+
+async function rememberTimelineMessage(env, chatId, result) {
+  const messageIds = result?.messageIds ?? [result?.messageId];
+  const safeIds = messageIds.filter((messageId) =>
+    Number.isSafeInteger(messageId) && messageId > 0
+  );
+  if (!safeIds.length) return;
+  const key = timelineMessagesKey(chatId);
+  const ids = await readTimelineMessageIds(env, chatId);
+  ids.push(...safeIds);
+  await env.CRASH_BOT_DB.prepare(`
+    INSERT INTO bot_settings (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).bind(key, JSON.stringify(ids)).run();
+}
+
+function messageControls(message, actorId) {
+  return conversationMessageControls(message, actorId, {
+    namespace: "ad",
+    includeView: true
+  });
+}
+
+async function sendTimelineMessages(env, chatId, messages, actorId) {
   for (const message of messages) {
+    const keyboard = messageControls(message, actorId);
+    const text = formatMessage(message, actorId, env.OWNER_TELEGRAM_ID)
+      .slice(0, 3900);
+    const textResult = await sendConversationContent(env, chatId, {
+      text,
+      inlineKeyboard: keyboard
+    });
+    await rememberTimelineMessage(env, chatId, textResult);
+
+    if (String(message.sender_id) !== String(actorId) &&
+        (message.visibility_status === "blocked" ||
+          message.view_delivery_status !== "sent")) continue;
     if (!message.media_type || !message.media_file_id) continue;
     const caption = ["sticker", "video_note"].includes(message.media_type)
       ? null
       : `${message.sender_role === "owner" ? "پاسخ مالک" : "پیام درخواست‌دهنده"}${message.caption ? `: ${message.caption}` : ""}`;
-    await sendMedia(env, chatId, {
-      type: message.media_type,
-      fileId: message.media_file_id
-    }, caption);
+    const mediaResult = await sendConversationContent(env, chatId, {
+      text: ["sticker", "video_note"].includes(message.media_type) ? text : "",
+      mediaType: message.media_type,
+      mediaFileId: message.media_file_id,
+      caption,
+      inlineKeyboard: keyboard
+    });
+    await rememberTimelineMessage(env, chatId, mediaResult);
   }
 }
 
@@ -144,6 +236,7 @@ async function renderRequesterConversation(env, chatId, userId, conversationId, 
   `).bind(conversationId, userId).first();
   if (!row) return false;
 
+  await clearTimelineMessages(env, chatId);
   await env.CRASH_BOT_DB.prepare(`
     UPDATE advertising_messages
     SET delivery_status = 'unknown',
@@ -151,31 +244,41 @@ async function renderRequesterConversation(env, chatId, userId, conversationId, 
     WHERE conversation_id = ? AND delivery_status = 'sending'
       AND created_at < datetime('now', '-15 minutes')
   `).bind(conversationId).run();
-  await saveActorState(env, userId, conversationId, "requester");
   await env.CRASH_BOT_DB.prepare(`
-    UPDATE advertising_messages SET read_at = CURRENT_TIMESTAMP
-    WHERE conversation_id = ? AND sender_role = 'owner' AND read_at IS NULL
+    UPDATE advertising_messages
+    SET view_delivery_status = 'unknown'
+    WHERE conversation_id = ? AND view_delivery_status = 'sending'
+      AND created_at < datetime('now', '-15 minutes')
   `).bind(conversationId).run();
-  const messages = await readConversationMessages(env, conversationId, page);
+  await saveActorState(env, userId, conversationId, "requester");
+  const { messages, hasOlder } = await readConversationMessages(
+    env, conversationId, page, userId
+  );
   const text = [
     "📢 گفت‌وگوی درخواست تبلیغات",
     "پیامت به مالک ربات ارسال می‌شود؛ پاسخ‌ها را همین‌جا دریافت می‌کنی.",
-    messages.length ? "" : "\nهنوز پیامی در این گفت‌وگو نیست.",
-    ...messages.map(formatMessage)
+    messages.length ? "پیام‌های این صفحه:" : "\nهنوز پیامی در این گفت‌وگو نیست."
   ].filter(Boolean).join("\n\n").slice(0, 3900);
   const keyboard = [];
   if (page > 0) keyboard.push([{ text: "پیام‌های جدیدتر", callback_data: `ad:user:${page - 1}` }]);
-  if (messages.length === MESSAGE_PAGE_SIZE) {
+  if (hasOlder) {
     keyboard.push([{ text: "پیام‌های قدیمی‌تر", callback_data: `ad:user:${page + 1}` }]);
   }
   await sendTrackedSectionInlineTelegram(env, chatId, text, keyboard);
-  await sendTimelineMedia(env, chatId, messages);
+  await sendTimelineMessages(env, chatId, messages, userId);
+  if (page === 0) {
+    await sendMessageTelegramDetailed(
+      env, chatId, "برای خروج از گفت‌وگو از دکمهٔ بازگشت استفاده کن.",
+      CHAT_RETURN_KEYBOARD
+    );
+  }
   return true;
 }
 
 async function renderOwnerConversationList(env, ownerId, chatId, page = 0) {
   if (String(ownerId) !== String(env.OWNER_TELEGRAM_ID)) return false;
   if (String(chatId) !== String(ownerId)) return false;
+  await clearTimelineMessages(env, chatId);
   await clearActorState(env, ownerId);
   await env.CRASH_BOT_DB.prepare(`
     UPDATE advertising_messages
@@ -184,11 +287,20 @@ async function renderOwnerConversationList(env, ownerId, chatId, page = 0) {
     WHERE delivery_status = 'sending'
       AND created_at < datetime('now', '-15 minutes')
   `).run();
+  await env.CRASH_BOT_DB.prepare(`
+    UPDATE advertising_messages
+    SET view_delivery_status = 'unknown'
+    WHERE view_delivery_status = 'sending'
+      AND created_at < datetime('now', '-15 minutes')
+  `).run();
   const rows = await env.CRASH_BOT_DB.prepare(`
     SELECT c.id, c.requester_id, c.updated_at, u.username, u.first_name,
+           u.last_name,
            p.nickname,
            (SELECT message FROM advertising_messages m
-            WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_message,
+            WHERE m.conversation_id = c.id AND m.visibility_status = 'visible'
+              AND (m.sender_role = 'owner' OR m.view_delivery_status = 'sent')
+            ORDER BY m.id DESC LIMIT 1) AS last_message,
            (SELECT COUNT(*) FROM advertising_messages unread
             WHERE unread.conversation_id = c.id
               AND unread.sender_role = 'requester' AND unread.read_at IS NULL) AS unread_count
@@ -198,22 +310,23 @@ async function renderOwnerConversationList(env, ownerId, chatId, page = 0) {
     WHERE c.status = 'open'
     ORDER BY c.updated_at DESC, c.id DESC
     LIMIT ? OFFSET ?
-  `).bind(PAGE_SIZE, page * PAGE_SIZE).all();
+  `).bind(PAGE_SIZE + 1, page * PAGE_SIZE).all();
 
-  const conversations = rows.results ?? [];
+  const results = rows.results ?? [];
+  const conversations = results.slice(0, PAGE_SIZE);
   const keyboard = conversations.map((row) => [{
     text: `${row.nickname || row.first_name || row.username || row.requester_id} · ${row.unread_count} خوانده‌نشده`,
     callback_data: `ad:open:${row.id}:0`
   }]);
   if (page > 0) keyboard.push([{ text: "صفحهٔ قبل", callback_data: `ad:list:${page - 1}` }]);
-  if (conversations.length === PAGE_SIZE) {
+  if (results.length > PAGE_SIZE) {
     keyboard.push([{ text: "صفحهٔ بعد", callback_data: `ad:list:${page + 1}` }]);
   }
 
   const list = conversations.length
     ? conversations.map((row) => {
         const identity = [
-          row.first_name,
+          [row.first_name, row.last_name].filter(Boolean).join(" "),
           row.username ? `@${row.username}` : null,
           `ID: ${row.requester_id}`
         ].filter(Boolean).join(" · ");
@@ -236,7 +349,7 @@ async function renderOwnerConversation(env, ownerId, chatId, conversationId, pag
     String(chatId) !== String(ownerId)
   ) return false;
   const conversation = await env.CRASH_BOT_DB.prepare(`
-    SELECT c.id, c.requester_id, u.username, u.first_name,
+    SELECT c.id, c.requester_id, u.username, u.first_name, u.last_name,
            p.nickname, p.bio, p.city, p.birth_year, p.birth_month,
            p.marital_status, p.gender, p.job, p.religion, p.religious_sect,
            p.field
@@ -247,6 +360,7 @@ async function renderOwnerConversation(env, ownerId, chatId, conversationId, pag
   `).bind(conversationId).first();
   if (!conversation) return false;
 
+  await clearTimelineMessages(env, chatId);
   await env.CRASH_BOT_DB.prepare(`
     UPDATE advertising_messages
     SET delivery_status = 'unknown',
@@ -254,14 +368,19 @@ async function renderOwnerConversation(env, ownerId, chatId, conversationId, pag
     WHERE conversation_id = ? AND delivery_status = 'sending'
       AND created_at < datetime('now', '-15 minutes')
   `).bind(conversationId).run();
-  await saveActorState(env, ownerId, conversationId, "owner");
   await env.CRASH_BOT_DB.prepare(`
-    UPDATE advertising_messages SET read_at = CURRENT_TIMESTAMP
-    WHERE conversation_id = ? AND sender_role = 'requester' AND read_at IS NULL
+    UPDATE advertising_messages
+    SET view_delivery_status = 'unknown'
+    WHERE conversation_id = ? AND view_delivery_status = 'sending'
+      AND created_at < datetime('now', '-15 minutes')
   `).bind(conversationId).run();
-  const messages = await readConversationMessages(env, conversationId, page);
+  await saveActorState(env, ownerId, conversationId, "owner");
+  const { messages, hasOlder } = await readConversationMessages(
+    env, conversationId, page, ownerId
+  );
   const identity = [
     conversation.first_name,
+    conversation.last_name,
     conversation.nickname ? `لقب پروفایل: ${conversation.nickname}` : null,
     conversation.bio ? `دربارهٔ من: ${conversation.bio}` : null,
     conversation.city ? `شهر: ${conversation.city}` : null,
@@ -283,18 +402,23 @@ async function renderOwnerConversation(env, ownerId, chatId, conversationId, pag
   ].filter(Boolean).join("\n");
   const text = [
     `📢 مکالمهٔ تبلیغات — ${identity}`,
-    messages.length ? "" : "\nهنوز پیامی در این گفت‌وگو نیست.",
-    ...messages.map(formatMessage)
+    messages.length ? "پیام‌های این صفحه:" : "\nهنوز پیامی در این گفت‌وگو نیست."
   ].filter(Boolean).join("\n\n").slice(0, 3900);
   const keyboard = [
     [{ text: "↩️ فهرست درخواست‌ها", callback_data: `ad:list:${Math.floor(page / 2)}` }]
   ];
   if (page > 0) keyboard.push([{ text: "پیام‌های جدیدتر", callback_data: `ad:open:${conversationId}:${page - 1}` }]);
-  if (messages.length === MESSAGE_PAGE_SIZE) {
+  if (hasOlder) {
     keyboard.push([{ text: "پیام‌های قدیمی‌تر", callback_data: `ad:open:${conversationId}:${page + 1}` }]);
   }
   await sendTrackedSectionInlineTelegram(env, chatId, text, keyboard);
-  await sendTimelineMedia(env, chatId, messages);
+  await sendTimelineMessages(env, chatId, messages, ownerId);
+  if (page === 0) {
+    await sendMessageTelegramDetailed(
+      env, chatId, "برای خروج از گفت‌وگو از دکمهٔ بازگشت استفاده کن.",
+      CHAT_RETURN_KEYBOARD
+    );
+  }
   return true;
 }
 
@@ -314,11 +438,29 @@ async function saveAndDeliverMessage(env, {
     return { handled: true, outcome: "rejected" };
   }
 
+  const conversation = await env.CRASH_BOT_DB.prepare(`
+    SELECT c.blocked_by, s.reply_to_message_id
+    FROM advertising_conversations c
+    JOIN advertising_conversation_state s
+      ON s.conversation_id = c.id AND s.actor_id = ?
+    WHERE c.id = ? AND c.status = 'open'
+  `).bind(senderId, conversationId).first();
+  if (!conversation) return { handled: false };
+  if (conversation.blocked_by &&
+      String(conversation.blocked_by) === String(senderId)) {
+    await sendMessageTelegramDetailed(
+      env, senderId, "این گفت‌وگو مسدود شده است؛ پیام ارسال نشد.",
+      null, sourceMessageId
+    );
+    return { handled: true, outcome: "blocked" };
+  }
+  const heldForReview = Boolean(conversation.blocked_by);
   const inserted = await env.CRASH_BOT_DB.prepare(`
     INSERT INTO advertising_messages
       (conversation_id, sender_id, sender_role, message, media_type,
-       media_file_id, caption, source_message_id, delivery_status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sending')
+       media_file_id, caption, source_message_id, reply_to_message_id,
+       visibility_status, delivery_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sending')
     ON CONFLICT(sender_id, source_message_id) WHERE source_message_id IS NOT NULL
     DO NOTHING
     RETURNING id
@@ -330,7 +472,9 @@ async function saveAndDeliverMessage(env, {
     media?.type ?? null,
     media?.fileId ?? null,
     message?.caption ?? null,
-    sourceMessageId ?? null
+    sourceMessageId ?? null,
+    conversation.reply_to_message_id ?? null,
+    heldForReview ? "blocked" : "visible"
   ).first();
 
   if (!inserted?.id) {
@@ -346,75 +490,233 @@ async function saveAndDeliverMessage(env, {
     UPDATE advertising_conversations SET updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `).bind(conversationId).run();
-
-  let outcome;
-  if (media) {
-    const prefix = senderRole === "requester"
-      ? `درخواست تبلیغات\nTelegram ID: ${senderId}`
-      : null;
-    const fullCaption = [prefix, content].filter(Boolean).join("\n\n");
-    const noCaption = ["sticker", "video_note"].includes(media.type);
-    let deliveredAnything = false;
-    if (["sticker", "video_note"].includes(media.type)) {
-      if (prefix) {
-        const header = await sendMessageTelegramDetailed(env, recipientId, prefix);
-        if (header.outcome === "sent") deliveredAnything = true;
-        else outcome = header.outcome;
-      }
-    }
-    if (!outcome) {
-      const caption = noCaption ? null : fullCaption.slice(0, 1024);
-      const result = await sendMedia(env, recipientId, media, caption);
-      if (result.outcome === "sent") deliveredAnything = true;
-      else outcome = deliveredAnything ? "unknown" : result.outcome;
-    }
-    const remainingContent = noCaption
-      ? (senderRole === "owner" ? content : "")
-      : fullCaption.slice(1024);
-    if (!outcome && remainingContent) {
-      const remaining = await sendMessageTelegramDetailed(
-        env,
-        recipientId,
-        remainingContent
-      );
-      if (remaining.outcome !== "sent") {
-        outcome = deliveredAnything ? "unknown" : remaining.outcome;
-      }
-    }
-    if (!outcome) outcome = deliveredAnything ? "sent" : "unknown";
-  } else {
-    const prefix = senderRole === "requester"
-      ? `📢 درخواست تبلیغات\nTelegram ID: ${senderId}\n\n`
-      : "";
-    outcome = (await sendMessageTelegramDetailed(
-      env, recipientId, `${prefix}${content}`
-    )).outcome;
+  if (conversation.reply_to_message_id) {
+    await env.CRASH_BOT_DB.prepare(`
+      UPDATE advertising_conversation_state
+      SET reply_to_message_id = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE actor_id = ? AND conversation_id = ? AND reply_to_message_id = ?
+    `).bind(senderId, conversationId, conversation.reply_to_message_id).run();
   }
 
-  const storedOutcome = outcome === "sent"
-    ? "sent"
-    : outcome === "rejected"
-      ? "failed"
-      : "unknown";
-  await env.CRASH_BOT_DB.prepare(`
-    UPDATE advertising_messages
-    SET delivery_status = ?, delivery_error = ?, read_at = NULL
-    WHERE id = ?
-  `).bind(
-    storedOutcome,
-    outcome === "rejected" ? "Telegram rejected the message" : null,
-    inserted.id
-  ).run();
+  const notice = heldForReview
+    ? `یک کاربر بلاک‌شده توسط شما برای شما پیام ناشناس فرستاده است.${senderRole === "requester" ? `\nTelegram ID: ${senderId}` : ""}`
+    : senderRole === "requester"
+      ? `📢 از بخش درخواست تبلیغات یک پیام ناشناس دارید.\nTelegram ID: ${senderId}`
+      : "از طرف مالک ربات یک پیام در گفت‌وگوی تبلیغات دارید.";
+  const recipientMessage = {
+    id: inserted.id,
+    sender_id: senderId,
+    visibility_status: heldForReview ? "blocked" : "visible"
+  };
+  const delivery = await deliverClaimedConversationMessage({
+    label: "advertising conversation notification",
+    deliver: () => sendInlineTelegramDetailed(
+      env, recipientId, notice, messageControls(recipientMessage, recipientId)
+    ),
+    settle: (status) => env.CRASH_BOT_DB.prepare(`
+      UPDATE advertising_messages
+      SET delivery_status = ?, delivery_error = ?, read_at = NULL
+      WHERE id = ?
+    `).bind(
+      status,
+      status === "failed" ? "Telegram rejected the message" : null,
+      inserted.id
+    ).run()
+  });
+  const outcome = delivery.result.outcome;
+  const storedOutcome = delivery.status;
   await sendMessageTelegramDetailed(
     env,
     senderId,
     outcome === "sent"
-      ? "✅ پیام ارسال شد."
+      ? heldForReview
+        ? "✅ پیام ثبت شد؛ تا زمان تأیید گیرنده محتوای آن نمایش داده نمی‌شود."
+        : "✅ پیام ثبت شد؛ گیرنده با دکمهٔ مشاهده می‌تواند آن را ببیند."
       : outcome === "unknown"
         ? "⚠️ وضعیت ارسال نامشخص است؛ برای جلوگیری از پیام تکراری، خودکار دوباره ارسال نمی‌کنیم."
-        : "❌ ارسال پیام انجام نشد. می‌توانی پس از بررسی دوباره پیام بدهی."
+        : "❌ اعلان پیام ارسال نشد. وضعیت ثبت پیام را از تاریخچه بررسی کن.",
+    null,
+    sourceMessageId
   );
   return { handled: true, outcome };
+}
+
+async function loadAdvertisingMessage(env, messageId, actorId) {
+  const row = await env.CRASH_BOT_DB.prepare(`
+    SELECT m.*, c.requester_id, c.blocked_by
+    FROM advertising_messages m
+    JOIN advertising_conversations c ON c.id = m.conversation_id
+    WHERE m.id = ? AND c.status = 'open'
+  `).bind(messageId).first();
+  if (!row) return null;
+  const owner = String(actorId) === String(env.OWNER_TELEGRAM_ID);
+  if (!owner && String(row.requester_id) !== String(actorId)) return null;
+  return { ...row, actor_role: owner ? "owner" : "requester" };
+}
+
+async function deliverAdvertisingMessageView(env, query, actorId, message, release) {
+  const received = String(message.sender_id) !== String(actorId);
+  if (!received) {
+    await answerCallbackQuery(env, query.id, "پیام دریافتی معتبر نیست.");
+    return true;
+  }
+  if (message.visibility_status === "blocked") {
+    if (!release || (message.blocked_by &&
+        String(message.blocked_by) !== String(actorId))) {
+      await answerCallbackQuery(env, query.id, "محتوای پیام تا تأیید گیرنده مخفی است.");
+      return true;
+    }
+    await env.CRASH_BOT_DB.batch([
+      env.CRASH_BOT_DB.prepare(`
+        UPDATE advertising_conversations
+        SET blocked_by = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND (blocked_by = ? OR blocked_by IS NULL)
+      `).bind(message.conversation_id, actorId),
+      env.CRASH_BOT_DB.prepare(`
+        UPDATE advertising_messages
+        SET visibility_status = 'visible'
+        WHERE id = ? AND visibility_status = 'blocked'
+          AND EXISTS (
+            SELECT 1 FROM advertising_conversations
+            WHERE id = ? AND blocked_by IS NULL
+          )
+      `).bind(message.id, message.conversation_id)
+    ]);
+    const released = await env.CRASH_BOT_DB.prepare(`
+      SELECT visibility_status, blocked_by
+      FROM advertising_messages m
+      JOIN advertising_conversations c ON c.id = m.conversation_id
+      WHERE m.id = ?
+    `).bind(message.id).first();
+    if (released?.visibility_status !== "visible" || released?.blocked_by) {
+      await answerCallbackQuery(env, query.id, "این پیام دیگر قابل آزادسازی نیست.");
+      return true;
+    }
+    message.visibility_status = "visible";
+    message.blocked_by = null;
+  } else if (release) {
+    await answerCallbackQuery(env, query.id, "این پیام دیگر در صف بررسی بلاک نیست.");
+    return true;
+  }
+
+  const claim = await env.CRASH_BOT_DB.prepare(`
+    UPDATE advertising_messages SET view_delivery_status = 'sending'
+    WHERE id = ? AND visibility_status = 'visible'
+      AND view_delivery_status = 'pending'
+    RETURNING id
+  `).bind(message.id).first();
+  if (!claim?.id) {
+    const state = await env.CRASH_BOT_DB.prepare(`
+      SELECT view_delivery_status FROM advertising_messages WHERE id = ?
+    `).bind(message.id).first();
+    await answerCallbackQuery(env, query.id,
+      state?.view_delivery_status === "sent"
+        ? "این پیام قبلاً باز شده است."
+        : "وضعیت نمایش پیام نامشخص است؛ ارسال تکراری انجام نمی‌شود.");
+    return true;
+  }
+
+  const heading = message.sender_role === "owner"
+    ? "پاسخ مالک"
+    : message.actor_role === "owner"
+      ? `درخواست‌دهنده · Telegram ID: ${message.sender_id}`
+      : "پیام ناشناس";
+  const body = message.caption || message.message || "رسانه";
+  const text = `${heading} — ${message.created_at}\n\n${body}`.slice(0, 3900);
+  const keyboard = messageControls({
+    ...message,
+    visibility_status: "visible",
+    view_delivery_status: "sent"
+  }, actorId);
+  const result = await sendConversationContent(env, actorId, {
+    text,
+    mediaType: message.media_type,
+    mediaFileId: message.media_file_id,
+    inlineKeyboard: keyboard
+  });
+
+  const viewStatus = result.outcome === "sent"
+    ? "sent"
+    : result.outcome === "rejected" ? "failed" : "unknown";
+  await env.CRASH_BOT_DB.prepare(`
+    UPDATE advertising_messages
+    SET view_delivery_status = ?, read_at = CASE
+      WHEN ? = 'sent' THEN CURRENT_TIMESTAMP ELSE read_at END
+    WHERE id = ? AND view_delivery_status = 'sending'
+  `).bind(viewStatus, viewStatus, message.id).run();
+  if (viewStatus === "sent" && message.source_message_id) {
+    await sendMessageTelegramDetailed(
+      env,
+      message.sender_id,
+      "طرف مقابل پیام شما را مشاهده کرد.",
+      null,
+      message.source_message_id
+    );
+  }
+  await answerCallbackQuery(env, query.id,
+    viewStatus === "sent"
+      ? "پیام نمایش داده شد."
+      : viewStatus === "unknown"
+        ? "وضعیت نمایش نامشخص است؛ ارسال دوباره انجام نمی‌شود."
+        : "نمایش پیام ناموفق بود.");
+  return true;
+}
+
+async function handleAdvertisingChatCallback(env, query, actorId) {
+  const action = /^(ad:view|ad:unblock_view|ad:reply|ad:block):(\d+)$/
+    .exec(String(query.data ?? ""));
+  if (!action) return false;
+  const messageId = Number(action[2]);
+  if (!Number.isSafeInteger(messageId) || messageId <= 0) {
+    await answerCallbackQuery(env, query.id, "شناسهٔ پیام معتبر نیست.");
+    return true;
+  }
+  const message = await loadAdvertisingMessage(env, messageId, actorId);
+  if (!message) {
+    await answerCallbackQuery(env, query.id, "این پیام در دسترس نیست.");
+    return true;
+  }
+  if (action[1] === "ad:view" || action[1] === "ad:unblock_view") {
+    return deliverAdvertisingMessageView(
+      env, query, actorId, message, action[1] === "ad:unblock_view"
+    );
+  }
+  if (action[1] === "ad:reply") {
+    if (message.visibility_status !== "visible" || message.blocked_by) {
+      await answerCallbackQuery(env, query.id, "ابتدا پیام را از حالت بلاک خارج کن.");
+      return true;
+    }
+    await saveActorState(env, actorId, message.conversation_id, message.actor_role);
+    await env.CRASH_BOT_DB.prepare(`
+      UPDATE advertising_conversation_state
+      SET reply_to_message_id = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE actor_id = ? AND conversation_id = ?
+    `).bind(message.id, actorId, message.conversation_id).run();
+    await sendMessageTelegramDetailed(
+      env, actorId,
+      "متن، ویس یا رسانهٔ دلخواه خود را برای طرف مقابل ارسال کنید.",
+      CHAT_RETURN_KEYBOARD
+    );
+    await answerCallbackQuery(env, query.id, "پاسخ آماده است.");
+    return true;
+  }
+  if (message.blocked_by &&
+      String(message.blocked_by) !== String(actorId)) {
+    await answerCallbackQuery(env, query.id, "این گفت‌وگو قبلاً مسدود شده است.");
+    return true;
+  }
+  await env.CRASH_BOT_DB.prepare(`
+    UPDATE advertising_conversations
+    SET blocked_by = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status = 'open' AND (blocked_by IS NULL OR blocked_by = ?)
+  `).bind(actorId, message.conversation_id, actorId).run();
+  await env.CRASH_BOT_DB.prepare(`
+    UPDATE advertising_conversation_state
+    SET reply_to_message_id = NULL, updated_at = CURRENT_TIMESTAMP
+    WHERE conversation_id = ?
+  `).bind(message.conversation_id).run();
+  await answerCallbackQuery(env, query.id, "این گفت‌وگوی تبلیغات مسدود شد.");
+  return true;
 }
 
 export async function openAdvertisingConversation(env, userId, chatId) {
@@ -440,6 +742,7 @@ export async function handleAdvertisingCallback(env, callback) {
   const list = /^ad:list:(\d+)$/.exec(data);
   const open = /^ad:open:(\d+):(\d+)$/.exec(data);
   const userPage = /^ad:user:(\d+)$/.exec(data);
+  if (await handleAdvertisingChatCallback(env, callback, ownerId)) return true;
   if (list) {
     matched = true;
     const page = Number(list[1]);
@@ -460,17 +763,7 @@ export async function handleAdvertisingCallback(env, callback) {
       await answerCallbackQuery(env, callback.id, "این گزینه فقط برای مالک در دسترس است.");
       return true;
     }
-    await env.CRASH_BOT_DB.prepare(`
-      INSERT INTO users (telegram_id, username, first_name)
-      VALUES (?, ?, ?)
-      ON CONFLICT(telegram_id) DO UPDATE SET
-        username = excluded.username,
-        first_name = excluded.first_name
-    `).bind(
-      ownerId,
-      callback.from.username ?? null,
-      callback.from.first_name ?? null
-    ).run();
+    await upsertTelegramUser(env, callback.from);
     const ok = await renderOwnerConversation(env, ownerId, chatId, conversationId, page);
     if (!ok) await answerCallbackQuery(env, callback.id, "این مکالمه در دسترس نیست.");
   } else if (userPage) {

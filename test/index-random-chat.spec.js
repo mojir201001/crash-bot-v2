@@ -81,6 +81,29 @@ afterEach(async () => {
 });
 
 describe("active Worker random chat route", () => {
+  it("removes a waiting user from the queue before handling another section", async () => {
+    await seedUser(users[0], "random_queue_exit", "مرد");
+    vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+
+    await sendMessage(users[0], 1, 11009, "🎭 چت ناشناس تصادفی");
+    await sendMessage(users[0], 2, 11010, "🔍 پیدا کردن فرد");
+    await sendMessage(users[0], 3, 11011, "👧 دختر");
+    const waiting = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM anonymous_sessions WHERE user_a_id = ? AND status = 'waiting'
+    `).bind(users[0]).first();
+    expect(waiting).toBeTruthy();
+
+    await sendMessage(users[0], 4, 11012, "🎭 آرشیو چت‌های ناشناس");
+
+    expect((await env.CRASH_BOT_DB.prepare(`
+      SELECT status FROM anonymous_sessions WHERE id = ?
+    `).bind(waiting.id).first()).status).toBe("cancelled");
+    expect(await env.CRASH_BOT_DB.prepare(`
+      SELECT user_id FROM anonymous_chat_members WHERE user_id = ?
+    `).bind(users[0]).first()).toBeNull();
+  });
+
   it("matches users through the menus and relays messages only inside the random session", async () => {
     await seedUser(users[0], "random_a", "مرد");
     await seedUser(users[1], "random_b", "زن");
@@ -90,7 +113,8 @@ describe("active Worker random chat route", () => {
       .mockResolvedValue({ outcome: "sent", messageId: 88 });
     vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
       .mockResolvedValue({ outcome: "sent" });
-    vi.spyOn(telegramApi, "deleteTelegramMessage").mockResolvedValue(false);
+    const deleteMessage = vi.spyOn(telegramApi, "deleteTelegramMessage")
+      .mockResolvedValue(false);
 
     expect((await sendMessage(users[0], 1, 11001, "🎭 چت ناشناس تصادفی")).status)
       .toBe(200);
@@ -117,6 +141,7 @@ describe("active Worker random chat route", () => {
 
     expect((await sendMessage(users[0], 4, 11007, "پیام ناشناس")).status)
       .toBe(200);
+    expect(deleteMessage).not.toHaveBeenCalledWith(env, users[0], 4);
     const saved = await env.CRASH_BOT_DB.prepare(`
       SELECT sender_id, recipient_id, message_type, session_id, message
       FROM anonymous_messages WHERE sender_id = ? AND source_message_id = ?
@@ -128,10 +153,24 @@ describe("active Worker random chat route", () => {
       session_id: session.id,
       message: "پیام ناشناس"
     });
-    expect(telegramApi.sendMessageTelegramDetailed).toHaveBeenCalledWith(
+    expect(telegramApi.sendInlineTelegramDetailed).toHaveBeenCalledWith(
       env,
       users[1],
-      "پیام ناشناس"
+      expect.stringContaining("منبع: چت ناشناس تصادفی"),
+      [[expect.objectContaining({ text: "مشاهده پیام" })]]
     );
+
+    expect((await sendMessage(
+      users[0], 5, 11008, "بازگشت به منوی اصلی"
+    )).status).toBe(200);
+    const ended = await env.CRASH_BOT_DB.prepare(`
+      SELECT status FROM anonymous_sessions WHERE id = ?
+    `).bind(session.id).first();
+    const selection = await env.CRASH_BOT_DB.prepare(`
+      SELECT conversation_id FROM active_conversation_selections
+      WHERE actor_id = ? AND conversation_type = 'random_chat'
+    `).bind(users[0]).first();
+    expect(ended.status).toBe("ended");
+    expect(selection).toBeNull();
   });
 });

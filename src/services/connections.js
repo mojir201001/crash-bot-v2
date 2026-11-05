@@ -15,6 +15,163 @@ import {
   setPostConversation
 } from "./posts.js";
 import { enqueueNotification, sendPendingNotification } from "./notification-outbox.js";
+import {
+  CHAT_RETURN_KEYBOARD,
+  CHAT_RETURN_BUTTON,
+  appendAndNotify,
+  clearConversationReplyContext,
+  clearConversationSelection,
+  getConversationSelection,
+  renderRecentConversationMessages,
+  selectConversation
+} from "./anonymous-chat.js";
+
+const PROFILE_MEDIA_METHODS = {
+  photo: "sendPhoto",
+  video: "sendVideo",
+  document: "sendDocument",
+  audio: "sendAudio",
+  voice: "sendVoice",
+  animation: "sendAnimation",
+  video_note: "sendVideoNote",
+  sticker: "sendSticker"
+};
+
+function publicProfileLines(profile, interests) {
+  const maritalStatus = {
+    single: "مجرد",
+    married: "متأهل"
+  }[profile.marital_status] ?? "ثبت نشده";
+  const gender = {
+    woman: "زن",
+    man: "مرد"
+  }[profile.gender] ?? "ثبت نشده";
+  const age = profile.birth_year && profile.birth_month
+    ? calculatePersianAge(profile.birth_year, profile.birth_month)
+    : null;
+  const lines = [
+    `👤 ${escapeHtml(profile.nickname || "ثبت نشده")}`,
+    `دربارهٔ من: ${escapeHtml(profile.bio || "ثبت نشده")}`,
+    `شهر: ${escapeHtml(profile.city || "ثبت نشده")}`,
+    `سن: ${age === null ? "ثبت نشده" : age}`,
+    `شغل: ${escapeHtml(profile.job || "ثبت نشده")}`,
+    `رشتهٔ تحصیلی: ${escapeHtml(profile.field || "ثبت نشده")}`,
+    `وضعیت تأهل: ${maritalStatus}`,
+    `جنسیت: ${gender}`,
+    `مذهب: ${escapeHtml(profile.religion || "ثبت نشده")}`,
+    `فرقه: ${escapeHtml(profile.religious_sect || "ثبت نشده")}`,
+    "",
+    "❤️ علاقه‌مندی‌ها:"
+  ];
+
+  if (!interests.length) {
+    lines.push("علاقه‌مندی ثبت نشده است.");
+  } else {
+    for (const [index, interest] of interests.entries()) {
+      const description = interest.content || interest.caption || "رسانه";
+      lines.push(
+        `${index + 1}. ${escapeHtml(interest.category)}: ${escapeHtml(description)}`
+      );
+    }
+  }
+  return lines;
+}
+
+function chunkHtmlLines(lines, maxLength = 3900) {
+  const chunks = [];
+  let chunk = "";
+  for (const line of lines) {
+    if (chunk && chunk.length + line.length + 1 > maxLength) {
+      chunks.push(chunk);
+      chunk = "";
+    }
+    if (line.length > maxLength) {
+      if (chunk) {
+        chunks.push(chunk);
+        chunk = "";
+      }
+      let segment = "";
+      for (const token of line.match(/&(?:amp|lt|gt|quot);|[\s\S]/gu) ?? []) {
+        if (segment.length + token.length > maxLength) {
+          chunks.push(segment);
+          segment = "";
+        }
+        segment += token;
+      }
+      chunk = segment;
+    } else {
+      chunk = chunk ? `${chunk}\n${line}` : line;
+    }
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks;
+}
+
+async function sendPublicProfile(env, chatId, profile, interests) {
+  const chunks = chunkHtmlLines(publicProfileLines(profile, interests));
+  const firstChunk = chunks.shift() ?? "پروفایل در دسترس نیست.";
+  if (profile.image_file_id) {
+    const caption = firstChunk.length <= 1024
+      ? firstChunk
+      : "👤 عکس پروفایل";
+    const result = await sendMediaTelegramDetailed(env, "sendPhoto", {
+      chat_id: chatId,
+      photo: profile.image_file_id,
+      caption,
+      parse_mode: "HTML"
+    });
+    if (result.outcome !== "sent") {
+      console.error("Could not send public profile picture:", result.outcome);
+      chunks.unshift(firstChunk);
+    } else if (caption !== firstChunk) {
+      chunks.unshift(firstChunk);
+    }
+  } else {
+    chunks.unshift(firstChunk);
+  }
+
+  for (const text of chunks) {
+    const result = await sendMediaTelegramDetailed(env, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML"
+    });
+    if (result.outcome !== "sent") {
+      console.error("Could not send public profile details:", result.outcome);
+      return false;
+    }
+  }
+
+  for (const interest of interests) {
+    const method = PROFILE_MEDIA_METHODS[interest.media_type];
+    if (!method || !interest.media_file_id) continue;
+    const caption = [
+      `❤️ ${escapeHtml(interest.category)}`,
+      escapeHtml(String(interest.caption || interest.content || "").slice(0, 150))
+    ].filter(Boolean).join("\n");
+    if (["video_note", "sticker"].includes(interest.media_type)) {
+      const label = await sendMediaTelegramDetailed(env, "sendMessage", {
+        chat_id: chatId,
+        text: `❤️ ${escapeHtml(interest.category)}`
+      });
+      if (label.outcome !== "sent") {
+        console.error("Could not label public profile interest media:", label.outcome);
+        continue;
+      }
+    }
+    const result = await sendMediaTelegramDetailed(env, method, {
+      chat_id: chatId,
+      [interest.media_type]: interest.media_file_id,
+      ...(caption && !["video_note", "sticker"].includes(interest.media_type)
+        ? { caption, parse_mode: "HTML" }
+        : {})
+    });
+    if (result.outcome !== "sent") {
+      console.error("Could not send public profile interest media:", result.outcome);
+    }
+  }
+  return true;
+}
 
 function mediaFromMessage(message) {
   const types = [
@@ -39,7 +196,8 @@ async function publicBotUsername(env) {
 
 async function sendConnectionRequestNotification(env, requestId, recipientId) {
   const request = await env.CRASH_BOT_DB.prepare(`
-    SELECT p.nickname, p.bio, p.city, p.job, p.field, c.requester_id
+    SELECT p.nickname, p.bio, p.city, p.job, p.field, p.religion,
+      p.religious_sect, p.marital_status, p.gender, c.requester_id
     FROM connection_requests c JOIN profiles p ON p.user_id = c.requester_id
     WHERE c.id = ? AND c.recipient_id = ? AND c.status = 'pending'
   `).bind(requestId, recipientId).first();
@@ -50,13 +208,31 @@ async function sendConnectionRequestNotification(env, requestId, recipientId) {
   const ageLabel = age?.birth_year && age?.birth_month
     ? `\nسن: ${calculatePersianAge(age.birth_year, age.birth_month)}`
     : "";
+  const interests = await env.CRASH_BOT_DB.prepare(`
+    SELECT category, content, caption, media_type, media_file_id
+    FROM interests WHERE user_id = ? ORDER BY id
+  `).bind(request.requester_id).all();
+  const interestText = (interests.results ?? []).map((interest) =>
+    `\n• ${escapeHtml(interest.category)}: ${escapeHtml(
+      interest.content || interest.caption || "رسانه"
+    )}${interest.media_file_id ? " [رسانهٔ پیوست]" : ""}`
+  ).join("");
   const snapshot = [
     `درخواست ارتباط از «${escapeHtml(request.nickname)}»`,
     request.bio ? `\nدربارهٔ من: ${escapeHtml(request.bio)}` : "",
     request.city ? `\nشهر: ${escapeHtml(request.city)}` : "",
     request.job ? `\nشغل: ${escapeHtml(request.job)}` : "",
     request.field ? `\nرشته: ${escapeHtml(request.field)}` : "",
+    request.religion ? `\nمذهب: ${escapeHtml(request.religion)}` : "",
+    request.religious_sect ? `\nفرقه/مذهب: ${escapeHtml(request.religious_sect)}` : "",
+    request.marital_status
+      ? `\nوضعیت تأهل: ${request.marital_status === "married" ? "متأهل" : "مجرد"}`
+      : "",
+    request.gender
+      ? `\nجنسیت: ${request.gender === "woman" ? "زن" : "مرد"}`
+      : "",
     ageLabel,
+    interestText ? `\n\nعلاقه‌مندی‌ها:${interestText}` : "\n\nعلاقه‌مندی ثبت نشده است.",
     "\n\nدرخواست را قبول می‌کنی؟"
   ].join("");
   const notification = await enqueueNotification(env, {
@@ -68,6 +244,34 @@ async function sendConnectionRequestNotification(env, requestId, recipientId) {
   });
   return await sendPendingNotification(env, notification,
     (claimed) => deliverConnectionOutboxNotification(env, claimed)) === "sent";
+}
+
+async function postPermalink(env, postId, messageId) {
+  if (!postId || !messageId) return null;
+  const [urlRow, idRow] = await Promise.all([
+    env.CRASH_BOT_DB.prepare(
+      "SELECT value FROM bot_settings WHERE key = 'crash_channel_url'"
+    ).first(),
+    env.CRASH_BOT_DB.prepare(
+      "SELECT value FROM bot_settings WHERE key = 'crash_channel_id'"
+    ).first()
+  ]);
+  const channelUrl = String(urlRow?.value ?? "").trim();
+  if (channelUrl) {
+    try {
+      const url = new URL(channelUrl);
+      if (url.protocol === "https:" &&
+          ["t.me", "www.t.me"].includes(url.hostname) &&
+          !url.pathname.includes("/+")) {
+        return `${url.origin}${url.pathname.replace(/\/+$/, "")}/${messageId}`;
+      }
+    } catch (error) {
+      console.error("Could not construct a channel post link from configured URL:", error);
+    }
+  }
+  const channelId = String(idRow?.value ?? "");
+  const internalId = /^-100\d+$/.test(channelId) ? channelId.slice(4) : null;
+  return internalId ? `https://t.me/c/${internalId}/${messageId}` : null;
 }
 
 export async function deliverConnectionOutboxNotification(env, outbox) {
@@ -100,75 +304,59 @@ export async function deliverConnectionOutboxNotification(env, outbox) {
     const result = await sendInlineTelegramDetailed(
       env, recipientId, profileText, keyboard, "HTML"
     );
+    if (result.outcome !== "sent") return result.outcome;
+    const interests = await env.CRASH_BOT_DB.prepare(`
+      SELECT id, category, content, caption, media_type, media_file_id
+      FROM interests WHERE user_id = ? AND media_file_id IS NOT NULL
+      ORDER BY id
+    `).bind(request.requester_id).all();
+    for (const interest of interests.results ?? []) {
+      const method = {
+        photo: "sendPhoto", video: "sendVideo", document: "sendDocument",
+        audio: "sendAudio", voice: "sendVoice", animation: "sendAnimation",
+        video_note: "sendVideoNote", sticker: "sendSticker"
+      }[interest.media_type];
+      if (!method) continue;
+      const noCaption = ["sticker", "video_note"].includes(interest.media_type);
+      const caption = noCaption ? null :
+        `علاقه‌مندی: ${interest.category}\n${interest.caption || interest.content || ""}`.slice(0, 1024);
+      const mediaResult = await sendMediaTelegramDetailed(env, method, {
+        chat_id: recipientId,
+        [interest.media_type]: interest.media_file_id,
+        ...(caption ? { caption } : {})
+      });
+      if (mediaResult.outcome !== "sent") return mediaResult.outcome;
+    }
     return result.outcome;
   }
 
   if (operation === "connection_decision") {
     const request = await env.CRASH_BOT_DB.prepare(`
-      SELECT requester_id, status FROM connection_requests WHERE id = ?
+      SELECT c.requester_id, c.status, c.post_id, p.channel_message_id
+      FROM connection_requests c
+      LEFT JOIN posts p ON p.id = c.post_id
+      WHERE c.id = ?
     `).bind(entityId).first();
     if (!request || String(request.requester_id) !== String(recipientId)) return false;
     const username = await publicBotUsername(env);
     const token = await createDeepLinkToken(env, "connection", entityId, recipientId);
-    const urlButton = username
-      ? { text: "مشاهدهٔ وضعیت", url: `https://t.me/${username}?start=${token}` }
-      : { text: "مشاهدهٔ وضعیت", callback_data: `connection:open:${entityId}` };
+    const keyboard = [[username
+      ? { text: "مشاهدهٔ گفت‌وگو", url: `https://t.me/${username}?start=${token}` }
+      : { text: "مشاهدهٔ گفت‌وگو", callback_data: `connection:open:${entityId}` }]];
+    const permalink = await postPermalink(env, request.post_id, request.channel_message_id);
+    if (permalink) keyboard.push([{ text: "مشاهدهٔ همان پست کانال", url: permalink }]);
     const message = request.status === "accepted"
       ? "درخواست ارتباط پذیرفته شد. گفت‌وگوی رباتی فعال است."
       : request.status === "rejected"
         ? "درخواست ارتباط شما رد شد."
         : "وضعیت درخواست ارتباط تغییر کرده است.";
     return (await sendInlineTelegramDetailed(
-      env, recipientId, outbox.message_snapshot ?? message, [[urlButton]]
+      env, recipientId, outbox.message_snapshot ?? message, keyboard
     )).outcome;
   }
 
   if (operation === "connection_message") {
-    const message = await env.CRASH_BOT_DB.prepare(`
-      SELECT m.sender_id, m.recipient_id, m.message, m.media_type,
-        m.media_file_id, m.caption, m.connection_id, c.status AS connection_status
-      FROM anonymous_messages m
-      JOIN connection_requests c ON c.id = m.connection_id
-      WHERE m.id = ? AND m.message_type = 'connection'
-    `).bind(entityId).first();
-    if (!message || String(message.recipient_id) !== String(recipientId)) return false;
-    const username = await publicBotUsername(env);
-    if (!username) throw new Error("TELEGRAM_BOT_USERNAME is not configured");
-    const token = await createDeepLinkToken(env, "connection", message.connection_id, recipientId);
-    const keyboard = { inline_keyboard: [[{
-      text: "بازکردن گفت‌وگو",
-      url: `https://t.me/${username}?start=${token}`
-    }]] };
-    if (message.connection_status !== "accepted") {
-      return (await sendInlineTelegramDetailed(
-        env,
-        recipientId,
-        outbox.message_snapshot ??
-          "یک پیام ثبت‌شده در گفت‌وگو در دسترس است؛ این ارتباط اکنون فعال نیست.",
-        keyboard.inline_keyboard
-      )).outcome;
-    }
-    if (message.media_file_id) {
-      const methods = {
-        photo: "sendPhoto", video: "sendVideo", document: "sendDocument",
-        audio: "sendAudio", voice: "sendVoice", animation: "sendAnimation",
-        video_note: "sendVideoNote", sticker: "sendSticker"
-      };
-      const method = methods[message.media_type];
-      if (!method) return false;
-      const field = message.media_type === "photo" ? "photo" : message.media_type;
-      const result = await sendMediaTelegramDetailed(env, method, {
-        chat_id: recipientId,
-        [field]: message.media_file_id,
-        ...(!["sticker", "video_note"].includes(message.media_type) && message.caption
-          ? { caption: message.caption } : {}),
-        reply_markup: keyboard
-      });
-      return result.outcome;
-    }
-    return (await sendInlineTelegramDetailed(env, recipientId,
-      outbox.message_snapshot ?? `پیام جدید در گفت‌وگوی فعال دریافت شد.\n\n${message.message ?? ""}`,
-      keyboard.inline_keyboard)).outcome;
+    return "sent";
   }
 
   return false;
@@ -204,60 +392,19 @@ export async function handleStartToken(env, userId, chatId, token) {
     ).bind(link.entityId).first();
     const profile = post && await env.CRASH_BOT_DB.prepare(`
       SELECT nickname, bio, city, birth_year, birth_month, job, field,
-        image_file_id
+        marital_status, gender, religion, religious_sect, image_file_id
       FROM profiles WHERE user_id = ?
     `).bind(post.user_id).first();
     if (!profile) {
       await sendTelegram(env, chatId, "پروفایل عمومی در دسترس نیست.");
       return true;
     }
-    const age = profile.birth_year && profile.birth_month
-      ? calculatePersianAge(profile.birth_year, profile.birth_month)
-      : null;
-    const body = [
-      `👤 ${escapeHtml(profile.nickname ?? "کاربر")}`,
-      profile.bio ? `\nدربارهٔ من: ${escapeHtml(profile.bio)}` : "",
-      profile.city ? `\nشهر: ${escapeHtml(profile.city)}` : "",
-      age !== null ? `\nسن: ${age}` : "",
-      profile.job ? `\nشغل: ${escapeHtml(profile.job)}` : "",
-      profile.field ? `\nرشته: ${escapeHtml(profile.field)}` : ""
-    ].join("");
+    const interests = await env.CRASH_BOT_DB.prepare(`
+      SELECT category, content, caption, media_type, media_file_id
+      FROM interests WHERE user_id = ? ORDER BY id
+    `).bind(post.user_id).all();
     await setPostConversation(env, userId, "profile_view", post.user_id);
-    if (profile.image_file_id) {
-      try {
-        if (body.length <= 1024) {
-          await sendMediaTelegram(env, "sendPhoto", {
-            chat_id: chatId,
-            photo: profile.image_file_id,
-            caption: body,
-            parse_mode: "HTML"
-          });
-        } else {
-          await sendMediaTelegram(env, "sendPhoto", {
-            chat_id: chatId,
-            photo: profile.image_file_id
-          });
-          await sendMediaTelegram(env, "sendMessage", {
-            chat_id: chatId,
-            text: body,
-            parse_mode: "HTML"
-          });
-        }
-      } catch (error) {
-        console.error("Could not send public profile picture:", error);
-        await sendMediaTelegram(env, "sendMessage", {
-          chat_id: chatId,
-          text: body,
-          parse_mode: "HTML"
-        });
-      }
-    } else {
-      await sendMediaTelegram(env, "sendMessage", {
-        chat_id: chatId,
-        text: body,
-        parse_mode: "HTML"
-      });
-    }
+    await sendPublicProfile(env, chatId, profile, interests.results ?? []);
     await sendInlineTelegram(env, chatId, "نمایش پروفایل فعال است.", [[
       { text: "خروج از پروفایل", callback_data: "profile:exit" }
     ]]);
@@ -265,7 +412,7 @@ export async function handleStartToken(env, userId, chatId, token) {
   }
   if (link.type === "connect") {
     const post = await env.CRASH_BOT_DB.prepare(`
-      SELECT p.id, p.user_id, pr.nickname, pr.bio, pr.city
+      SELECT p.id, p.user_id, p.user_record_number, pr.nickname, pr.bio, pr.city
       FROM posts p JOIN profiles pr ON pr.user_id = p.user_id
       WHERE p.id = ? AND p.status = 'published' AND p.channel_message_id IS NOT NULL
     `).bind(link.entityId).first();
@@ -275,10 +422,10 @@ export async function handleStartToken(env, userId, chatId, token) {
     }
     await setPostConversation(env, userId, "connection_confirm", post.id);
     await sendInlineTelegram(env, chatId,
-      `درخواست ارتباط با «${escapeHtml(post.nickname)}» دربارهٔ پست #${post.id}\n\nمطمئنی می‌خواهی درخواست ارتباط ارسال شود؟`,
+      `درخواست ارتباط با «${escapeHtml(post.nickname)}» دربارهٔ پست #${post.user_record_number ?? "نامشخص"}\n\nمطمئنی می‌خواهی درخواست ارتباط ارسال شود؟`,
       [[
         { text: "✅ بله، ارسال درخواست", callback_data: `connection:confirm:${post.id}` },
-        { text: "لغو", callback_data: "connection:cancel" }
+        { text: "لغو", callback_data: `connection:cancel:${post.id}` }
       ]]);
     return true;
   }
@@ -306,7 +453,8 @@ export async function handleStartToken(env, userId, chatId, token) {
   }
   if (link.type === "post_history") {
     const post = await env.CRASH_BOT_DB.prepare(`
-      SELECT id, status, content, caption, created_at, reviewed_at, admin_note
+      SELECT id, user_record_number, status, content, caption, created_at,
+        reviewed_at, admin_note
       FROM posts WHERE id = ? AND user_id = ?
     `).bind(link.entityId, userId).first();
     if (!post) {
@@ -314,24 +462,35 @@ export async function handleStartToken(env, userId, chatId, token) {
       return true;
     }
     await sendTelegram(env, chatId,
-      `سابقهٔ #${post.id}\nوضعیت: ${post.status}\nدریافت: ${post.created_at}\nاقدام: ${post.reviewed_at ?? "—"}${post.admin_note ? `\nتوضیح مدیر: ${post.admin_note}` : ""}\n\n${post.caption ?? post.content}`);
+      `سابقهٔ #${post.user_record_number ?? "نامشخص"}\nوضعیت: ${post.status}\nدریافت: ${post.created_at}\nاقدام: ${post.reviewed_at ?? "—"}${post.admin_note ? `\nتوضیح مدیر: ${post.admin_note}` : ""}\n\n${post.caption ?? post.content}`);
     return true;
   }
   return false;
 }
 
 export async function handleConnectionMessage(env, message, userId) {
-  const flow = await env.CRASH_BOT_DB.prepare(`
-    SELECT flow_type, entity_id FROM user_conversations WHERE user_id = ?
-  `).bind(userId).first();
+  const selection = await getConversationSelection(env, userId);
+  if (selection && selection.conversation_type !== "connection") return false;
+  const flow = selection
+    ? { flow_type: "connection_chat", entity_id: selection.conversation_id }
+    : await env.CRASH_BOT_DB.prepare(`
+      SELECT flow_type, entity_id FROM user_conversations WHERE user_id = ?
+    `).bind(userId).first();
   if (!flow) return false;
   const navigation = [
     "/start", "/menu", "🏠 منوی اصلی", "⬅️ بازگشت", "🛠 پنل مدیریت",
+    CHAT_RETURN_BUTTON,
     "👤 پنل کاربر", "💌 ثبت پست کراش", "✍️ شروع ثبت پست",
     "🤝 درخواست‌های ارتباط از کانال", "📚 ثبت کراش‌های من"
   ];
   if (navigation.includes(message.text?.trim())) {
     await clearPostConversation(env, userId);
+    if (selection?.conversation_type === "connection") {
+      await clearConversationSelection(env, userId);
+      await clearConversationReplyContext(env, userId, {
+        type: "connection", id: Number(selection.conversation_id)
+      });
+    }
     return false;
   }
   if (flow.flow_type === "profile_view") return false;
@@ -352,46 +511,23 @@ export async function handleConnectionMessage(env, message, userId) {
   }
   const peerId = String(request.requester_id) === String(userId)
     ? request.recipient_id : request.requester_id;
-  const media = mediaFromMessage(message);
-  const body = message.text ?? message.caption ?? "";
-  if (!String(body).trim() && !media?.fileId) {
-    await sendTelegram(env, message.chat.id, "پیام متنی یا رسانهٔ پشتیبانی‌شده بفرست.");
-    return true;
-  }
-  if (!Number.isSafeInteger(message.message_id) || message.message_id <= 0) {
-    await sendTelegram(env, message.chat.id, "شناسهٔ پیام معتبر نیست؛ لطفاً دوباره تلاش کن.");
-    return true;
-  }
-  const inserted = await env.CRASH_BOT_DB.prepare(`
-    INSERT INTO anonymous_messages (
-      sender_id, recipient_id, message, message_type, connection_id,
-      media_type, media_file_id, caption, source_message_id
-    ) VALUES (?, ?, ?, 'connection', ?, ?, ?, ?, ?)
-    ON CONFLICT(sender_id, source_message_id)
-      WHERE message_type = 'connection' AND source_message_id IS NOT NULL
-    DO NOTHING
-    RETURNING id
-  `).bind(userId, peerId, body, flow.entity_id, media.type, media.fileId,
-    message.caption ?? null, message.message_id).first();
-  if (!inserted?.id) {
-    await sendTelegram(env, message.chat.id, "این پیام قبلاً در گفت‌وگو ثبت شده است.");
-    return true;
-  }
-  const notification = await enqueueNotification(env, {
+  const result = await appendAndNotify(env, {
+    senderId: userId,
     recipientId: peerId,
-    operation: "connection_message",
-    entityId: inserted.id,
-    eventKey: `connection-message:${inserted.id}`,
-    messageSnapshot: `پیام جدید در گفت‌وگوی فعال دریافت شد.\n\n${body}`
+    sourceType: "connection",
+    connectionId: Number(flow.entity_id),
+    message,
+    sourceMessageId: message.message_id
   });
-  const deliveryStatus = await sendPendingNotification(env, notification,
-    (claimed) => deliverConnectionOutboxNotification(env, claimed));
-  await sendTelegram(env, message.chat.id,
-    deliveryStatus === "sent"
-      ? "پیام به گفت‌وگوی فعال ارسال شد."
-      : deliveryStatus === "unknown"
-        ? "نتیجهٔ تحویل نامشخص است؛ از ارسال دوبارهٔ همان پیام خودداری کن."
-        : "پیام ثبت شد، اما اعلان آن ارسال نشد.");
+  if (result.status === "invalid") {
+    await sendTelegram(env, message.chat.id,
+      "پیام متنی یا رسانهٔ پشتیبانی‌شده بفرست.");
+  } else if (result.status === "blocked") {
+    await sendTelegram(env, message.chat.id, "این گفت‌وگو مسدود شده است.");
+  } else if (result.status === "inactive") {
+    await sendTelegram(env, message.chat.id,
+      "این ارتباط دیگر فعال نیست و پیام ثبت نشد.");
+  }
   return true;
 }
 
@@ -427,12 +563,29 @@ export async function handleConnectionCallback(env, query) {
       await answerCallbackQuery(env, query.id, "این ارتباط فعال نیست یا متعلق به شما نیست.");
       return true;
     }
-    await setPostConversation(env, actorId, "connection_chat", connectionId);
+    await selectConversation(env, actorId, "connection", connectionId);
     await answerCallbackQuery(env, query.id, "گفت‌وگوی فعال باز شد.");
-    await sendTelegram(env, query.message.chat.id, "پیام متنی یا رسانه‌ای خود را بفرست.");
+    await sendTelegram(
+      env, query.message.chat.id, "پیام متنی یا رسانه‌ای خود را بفرست.",
+      CHAT_RETURN_KEYBOARD
+    );
+    await renderRecentConversationMessages(
+      env, actorId, "connection", connectionId, 20
+    );
     return true;
   }
-  if (data === "connection:cancel") {
+  const cancel = /^connection:cancel:(\d+)$/.exec(data);
+  if (cancel) {
+    const postId = Number(cancel[1]);
+    const flow = await env.CRASH_BOT_DB.prepare(`
+      SELECT flow_type, entity_id FROM user_conversations WHERE user_id = ?
+    `).bind(actorId).first();
+    if (!Number.isSafeInteger(postId) || postId <= 0 ||
+        flow?.flow_type !== "connection_confirm" ||
+        Number(flow.entity_id) !== postId) {
+      await answerCallbackQuery(env, query.id, "این درخواست دیگر فعال نیست.");
+      return true;
+    }
     await clearPostConversation(env, actorId);
     await answerCallbackQuery(env, query.id, "درخواست لغو شد.");
     await sendTelegram(env, query.message.chat.id, "درخواست ارتباط ارسال نشد.");
@@ -497,7 +650,8 @@ export async function handleConnectionCallback(env, query) {
       "SELECT requester_id FROM connection_requests WHERE id = ?"
     ).bind(requestId).first();
     await sendTelegram(env, query.message.chat.id,
-      newStatus === "accepted" ? "ارتباط فعال شد؛ پیام خود را برای گفت‌وگو بفرست." : "درخواست ارتباط رد شد.");
+      newStatus === "accepted" ? "ارتباط فعال شد؛ پیام خود را برای گفت‌وگو بفرست." : "درخواست ارتباط رد شد.",
+      newStatus === "accepted" ? CHAT_RETURN_KEYBOARD : undefined);
     const notification = await enqueueNotification(env, {
       recipientId: requester.requester_id,
       operation: "connection_decision",
@@ -509,10 +663,6 @@ export async function handleConnectionCallback(env, query) {
     });
     await sendPendingNotification(env, notification,
       (claimed) => deliverConnectionOutboxNotification(env, claimed));
-    if (newStatus === "accepted") {
-      await setPostConversation(env, actorId, "connection_chat", requestId);
-      await setPostConversation(env, requester.requester_id, "connection_chat", requestId);
-    }
     return true;
   }
   const open = /^connection:open:(\d+)$/.exec(data);
@@ -536,9 +686,13 @@ export async function renderConnections(env, userId, chatId, section) {
   const bind = section === "active" ? [userId, userId] : [userId];
   const rows = await env.CRASH_BOT_DB.prepare(`
     SELECT c.id, c.requester_id, c.recipient_id, c.post_id, c.status, c.created_at,
-      p.nickname AS requester_nickname
+      requester_profile.nickname AS requester_nickname,
+      recipient_profile.nickname AS recipient_nickname
     FROM connection_requests c
-    LEFT JOIN profiles p ON p.user_id = c.requester_id
+    LEFT JOIN profiles requester_profile
+      ON requester_profile.user_id = c.requester_id
+    LEFT JOIN profiles recipient_profile
+      ON recipient_profile.user_id = c.recipient_id
     WHERE ${conditions.replaceAll("requester_id", "c.requester_id").replaceAll("recipient_id", "c.recipient_id").replaceAll("status", "c.status")}
     ORDER BY created_at DESC, id DESC LIMIT 30
   `).bind(...bind).all();
@@ -549,8 +703,13 @@ export async function renderConnections(env, userId, chatId, section) {
   for (const request of rows.results) {
     const displayStatus = request.status === "accepted" ? "فعال"
       : request.status === "rejected" ? "ردشده" : "در انتظار";
+    const peerNickname = String(request.requester_id) === String(userId)
+      ? request.recipient_nickname : request.requester_nickname;
     const keyboard = request.status === "accepted"
-      ? [[{ text: "گفت‌وگوی فعال", callback_data: `connection:chat:${request.id}` }]]
+      ? [[{
+        text: section === "active" ? peerNickname || "گفت‌وگوی ناشناس" : "گفت‌وگوی فعال",
+        callback_data: `connection:chat:${request.id}`
+      }]]
       : section === "incoming" && request.status === "pending"
         ? [[
           { text: "✅ قبول", callback_data: `connection:decision:${request.id}:accepted` },
