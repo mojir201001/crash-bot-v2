@@ -54,6 +54,7 @@ export const stage3Routes = {
   "🎭 چت ناشناس تصادفی": "anonymous_random",
   "🎭 ارتباط ناشناس": "anonymous",
   "🎲 چت ناشناس تصادفی": "anonymous_random",
+  "🔗 لینک ناشناس من": "anonymous_link",
   "🔗 لینک اختصاصی چت": "anonymous_link",
   "🔎 ارتباط با آیدی": "anonymous_username",
   "🔔 اعلان‌ها": "anonymous_inbox",
@@ -198,7 +199,7 @@ const screens = {
     text: "🎭 ارتباط ناشناس\n\nیکی از روش‌های چت ناشناس را انتخاب کن.",
     rows: [
       [{ text: "🎲 چت ناشناس تصادفی" }],
-      [{ text: "🔗 لینک اختصاصی چت" }, { text: "🔎 ارتباط با آیدی" }],
+      [{ text: "🔗 لینک ناشناس من" }, { text: "🔎 ارتباط با آیدی" }],
       [{ text: "🔔 اعلان‌ها" }]
     ],
     back: "↩️ بازگشت به منوی کاربر"

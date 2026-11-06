@@ -1,6 +1,7 @@
 import {
   answerCallbackQuery,
   deleteTelegramMessage,
+  editTelegramReplyMarkupDetailed,
   sendInlineTelegramDetailed,
   sendMediaTelegramDetailed,
   sendMessageTelegramDetailed,
@@ -11,6 +12,9 @@ import {
   conversationMediaFromMessage,
   conversationMessageControls,
   deliverClaimedConversationMessage,
+  isBotCommand,
+  isPrivateConversationMessage,
+  sendConversationReadReceipt,
   sendConversationContent
 } from "./conversation-engine.js";
 
@@ -44,7 +48,7 @@ const NAVIGATION_TEXTS = new Set([
   "/start", "/menu", "🏠 منوی اصلی", "⬅️ بازگشت",
   CHAT_RETURN_BUTTON,
   "🎭 ارتباط ناشناس", "🎭 چت ناشناس تصادفی",
-  "🔗 لینک اختصاصی چت", "🔎 ارتباط با آیدی", "🔔 اعلان‌ها",
+  "🔗 لینک ناشناس من", "🔗 لینک اختصاصی چت", "🔎 ارتباط با آیدی", "🔔 اعلان‌ها",
   "🤝 درخواست‌های ارتباط از کانال", "👤 پروفایل من",
   "💌 ثبت پست کراش", "📚 ثبت کراش‌های من",
   "📖 راهنما و قوانین", "📢 ثبت درخواست تبلیغات",
@@ -62,7 +66,9 @@ function messageContent(message) {
 function privateActor(query) {
   const actorId = query?.from?.id;
   const chatId = query?.message?.chat?.id;
-  return actorId && query?.message?.chat?.type === "private" &&
+  return Number.isSafeInteger(actorId) && actorId > 0 &&
+    Number.isSafeInteger(query?.message?.message_id) &&
+    query?.message?.chat?.type === "private" &&
     String(actorId) === String(chatId) ? actorId : null;
 }
 
@@ -293,43 +299,16 @@ async function recoverStaleAnonymousWork(env, messageId = null) {
   `).run();
 }
 
-async function displaySenderCopy(env, messageId, reference) {
+async function displaySenderCopy(env, messageId) {
   const claimed = await env.CRASH_BOT_DB.prepare(`
     UPDATE anonymous_messages
-    SET sender_display_status = 'sending'
+    SET sender_display_status = 'sent',
+        sender_display_message_id = NULL
     WHERE id = ? AND sender_display_status = 'pending'
     RETURNING id
   `).bind(messageId).first();
-  if (!claimed) return null;
 
-  const message = await env.CRASH_BOT_DB.prepare(`
-    SELECT id, sender_id, recipient_id, message, caption, media_type,
-      media_file_id, reply_to_message_id, created_at, session_id, connection_id
-    FROM anonymous_messages WHERE id = ?
-  `).bind(messageId).first();
-  if (!message) return "failed";
-
-  let result;
-  try {
-    result = await replayConversationMessage(
-      env, message.sender_id, reference, message, 0, false, true
-    );
-  } catch (error) {
-    console.error("Could not display anonymous message to its sender:", error?.name ?? "unknown error");
-    result = { outcome: "unknown" };
-  }
-  const status = result?.outcome === "sent" ? "sent"
-    : result?.outcome === "rejected" ? "failed" : "unknown";
-  await env.CRASH_BOT_DB.prepare(`
-    UPDATE anonymous_messages
-    SET sender_display_status = ?, sender_display_message_id = ?
-    WHERE id = ? AND sender_display_status = 'sending'
-  `).bind(
-    status,
-    status === "sent" ? result.messageId : null,
-    messageId
-  ).run();
-  return status;
+  return claimed ? "sent" : null;
 }
 
 export async function deliverAnonymousMessageNotification(env, messageId) {
@@ -358,7 +337,7 @@ export async function deliverAnonymousMessageNotification(env, messageId) {
     deliver: () => sendInlineTelegramDetailed(
       env,
       claimed.recipient_id,
-      `🔔 پیام جدید در گفت‌وگوی ناشناس\nمنبع: ${SOURCE_LABELS[claimed.source_type]}\nبرای مشاهده و پاسخ، دکمه را بزن.`,
+      `🔔 شما یک پیام دارید\nمنبع: ${SOURCE_LABELS[claimed.source_type]}\nبرای مشاهده و پاسخ، دکمه را بزن.`,
       [[{
         text: "مشاهده پیام",
         callback_data: `anon:inbox:open:${claimed.id}`
@@ -386,6 +365,67 @@ export async function deliverAnonymousMessageNotification(env, messageId) {
   return status;
 }
 
+async function isActiveConversation(env, reference, firstUserId, secondUserId) {
+  if (reference.type === "connection") {
+    return Boolean(await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM connection_requests
+      WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
+        AND ((requester_id = ? AND recipient_id = ?)
+          OR (requester_id = ? AND recipient_id = ?))
+    `).bind(
+      reference.id, firstUserId, secondUserId, secondUserId, firstUserId
+    ).first());
+  }
+  if (reference.type === "random_chat") {
+    return Boolean(await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM anonymous_sessions
+      WHERE id = ? AND status = 'active'
+        AND ((user_a_id = ? AND user_b_id = ?)
+          OR (user_a_id = ? AND user_b_id = ?))
+    `).bind(
+      reference.id, firstUserId, secondUserId, secondUserId, firstUserId
+    ).first());
+  }
+  return Boolean(await env.CRASH_BOT_DB.prepare(`
+    SELECT id FROM anonymous_conversations
+    WHERE id = ? AND source_type = ? AND status = 'active'
+      AND ((user_a_id = ? AND user_b_id = ?)
+        OR (user_a_id = ? AND user_b_id = ?))
+  `).bind(
+    reference.id, reference.type,
+    firstUserId, secondUserId, secondUserId, firstUserId
+  ).first());
+}
+
+async function holdBlockedMessage(env, {
+  reference, senderId, recipientId, message, sourceMessageId
+}) {
+  if (!await isActiveConversation(env, reference, senderId, recipientId)) {
+    return { status: "inactive" };
+  }
+  const rows = await env.CRASH_BOT_DB.prepare(`
+    SELECT blocker_id FROM conversation_blocks
+    WHERE conversation_type = ? AND conversation_id = ?
+      AND ((blocker_id = ? AND blocked_id = ?)
+        OR (blocker_id = ? AND blocked_id = ?))
+  `).bind(
+    reference.type, reference.id, recipientId, senderId, senderId, recipientId
+  ).all();
+  const blockedByRecipient = (rows.results ?? []).some((row) =>
+    String(row.blocker_id) === String(recipientId));
+  if (blockedByRecipient) {
+    await storeBlockedMessageForReview(env, {
+      reference, senderId, recipientId, message, sourceMessageId
+    });
+  } else {
+    await sendMessageTelegramDetailed(
+      env, senderId, "پیام تحویل نشد؛ این گفت‌وگو در دسترس نیست.",
+      null, sourceMessageId
+    );
+  }
+  return { status: "blocked" };
+}
+
 export async function appendAndNotify(env, {
   senderId,
   recipientId,
@@ -397,6 +437,9 @@ export async function appendAndNotify(env, {
   sourceMessageId,
   skipRecipientNotification = false
 }) {
+  if (!Number.isSafeInteger(senderId) || senderId <= 0 ||
+      !Number.isSafeInteger(recipientId) || recipientId <= 0 ||
+      senderId === recipientId) return { status: "invalid" };
   const content = messageContent(message);
   const media = mediaFromMessage(message);
   if (!content && !media) return { status: "invalid" };
@@ -417,22 +460,9 @@ export async function appendAndNotify(env, {
     return { status: "inactive" };
   }
   if (await isConversationBlocked(env, reference, senderId, recipientId)) {
-    const recipientBlockedSender = await env.CRASH_BOT_DB.prepare(`
-      SELECT id FROM conversation_blocks
-      WHERE conversation_type = ? AND conversation_id = ?
-        AND blocker_id = ? AND blocked_id = ?
-    `).bind(reference.type, reference.id, recipientId, senderId).first();
-    if (recipientBlockedSender) {
-      await storeBlockedMessageForReview(env, {
-        reference, senderId, recipientId, message, sourceMessageId
-      });
-    } else {
-      await sendMessageTelegramDetailed(
-        env, senderId, "پیام تحویل نشد؛ این گفت‌وگو در دسترس نیست.",
-        null, sourceMessageId
-      );
-    }
-    return { status: "blocked" };
+    return holdBlockedMessage(env, {
+      reference, senderId, recipientId, message, sourceMessageId
+    });
   }
   const replyToMessageId = await getConversationReplyMessageId(
     env, senderId, reference, recipientId
@@ -488,7 +518,7 @@ export async function appendAndNotify(env, {
       SELECT ?, ?, ?, 'connection', ?, ?, ?, ?, ?, ?, 'sending'
       WHERE EXISTS (
         SELECT 1 FROM connection_requests c
-        WHERE c.id = ? AND c.status = 'accepted'
+        WHERE c.id = ? AND c.status = 'accepted' AND c.ended_at IS NULL
           AND (
             (c.requester_id = ? AND c.recipient_id = ?)
             OR (c.recipient_id = ? AND c.requester_id = ?)
@@ -552,7 +582,14 @@ export async function appendAndNotify(env, {
       SELECT id FROM anonymous_messages
       WHERE sender_id = ? AND source_message_id = ? AND message_type = ?
     `).bind(senderId, sourceMessageId, messageType).first();
-    if (!duplicate) return { status: "inactive" };
+    if (!duplicate) {
+      if (await isConversationBlocked(env, reference, senderId, recipientId)) {
+        return holdBlockedMessage(env, {
+          reference, senderId, recipientId, message, sourceMessageId
+        });
+      }
+      return { status: "inactive" };
+    }
     inserted = duplicate;
     isDuplicate = true;
   } else {
@@ -582,23 +619,10 @@ export async function appendAndNotify(env, {
     status = await deliverAnonymousMessageNotification(env, inserted.id);
   }
   if (!isDuplicate && !skipRecipientNotification) {
-    const acknowledgement = status === "sent"
-      ? "✅ پیام در تاریخچهٔ گفت‌وگو ثبت شد؛ گیرنده با اعلان ناشناس می‌تواند آن را ببیند."
-      : status === "unknown"
-        ? "⚠️ وضعیت ارسال اعلان نامشخص است؛ اعلان تکراری خودکار ساخته نمی‌شود."
-        : status === "failed"
-          ? "❌ اعلان پیام ارسال نشد؛ پیام در تاریخچه باقی مانده است."
-          : status === "blocked"
-            ? "این گفت‌وگو مسدود شده است."
-            : "این گفت‌وگو دیگر فعال نیست.";
-    await sendInlineTelegramDetailed(
+    await sendMessageTelegramDetailed(
       env,
       senderId,
-      acknowledgement,
-      [[{
-        text: "📜 مشاهدهٔ تاریخچه",
-        callback_data: `anon:history:${inserted.id}:0`
-      }]],
+      "\u2705 \u067e\u06cc\u0627\u0645 \u0634\u0645\u0627 \u0627\u0631\u0633\u0627\u0644 \u0634\u062f.",
       null,
       sourceMessageId
     );
@@ -633,7 +657,7 @@ async function storeBlockedMessageForReview(env, {
   const claimed = await env.CRASH_BOT_DB.prepare(`
     UPDATE anonymous_blocked_messages
     SET notice_status = 'sending', updated_at = CURRENT_TIMESTAMP
-    WHERE id = ? AND notice_status = 'pending'
+    WHERE id = ? AND notice_status IN ('pending', 'failed')
     RETURNING id
   `).bind(row.id).first();
   if (claimed) {
@@ -642,14 +666,19 @@ async function storeBlockedMessageForReview(env, {
       outcome = (await sendInlineTelegramDetailed(
         env,
         recipientId,
-        "یک کاربر بلاک‌شده توسط شما برای شما پیام ناشناس ارسال کرده است. در صورت تمایل برای مشاهده پیام، دکمه زیر را بزنید.",
+        "شما از فردی که در حال حاضر بلاک کرده‌اید یک پیام جدید دارید. برای مشاهده پیام، ابتدا بلاک فرستنده را بردارید.",
         [[{
-          text: "خروج از بلاک و مشاهده پیام",
+          text: "رفع بلاک و مشاهده پیام",
           callback_data: `anon:unblock_view:${row.id}`
         }]]
       )).outcome;
     } catch (error) {
       console.error("Could not deliver blocked-message notice:", error?.name ?? "unknown error");
+    }
+    if (outcome === "rejected") {
+      console.error("Could not deliver blocked-message notice: Telegram rejected the send");
+    } else if (outcome === "unknown") {
+      console.error("Blocked-message notice delivery outcome is unknown");
     }
     await env.CRASH_BOT_DB.prepare(`
       UPDATE anonymous_blocked_messages SET notice_status = ?,
@@ -658,12 +687,13 @@ async function storeBlockedMessageForReview(env, {
       outcome === "sent" ? "sent" : outcome === "rejected" ? "failed" : "unknown",
       row.id
     ).run();
+    const senderNotice = outcome === "sent"
+      ? "پیام ثبت شد؛ گیرنده برای مشاهده باید آن را تأیید کند."
+      : outcome === "rejected"
+        ? "پیام ذخیره شد، اما اعلان به گیرنده تحویل نشد. پردازش دوبارهٔ همین پیام می‌تواند اعلان را مجدداً تلاش کند."
+        : "پیام ذخیره شد، اما وضعیت اعلان مشخص نیست؛ برای جلوگیری از اعلان تکراری خودکار تکرار نمی‌شود.";
     await sendMessageTelegramDetailed(
-      env,
-      senderId,
-      "پیامت به‌دلیل تنظیم بلاک در انتظار تصمیم گیرنده است و هنوز تحویل نشده است.",
-      null,
-      sourceMessageId
+      env, senderId, senderNotice, null, sourceMessageId
     );
   }
 }
@@ -673,14 +703,15 @@ export async function renderAnonymousHome(env, chatId) {
     "🎭 ارتباط ناشناس\n\nیک روش ارتباط انتخاب کن. نام کاربری و شناسهٔ تلگرام در پیام‌های گفت‌وگو نمایش داده نمی‌شود.",
     [
       [{ text: "🎭 چت ناشناس تصادفی" }],
-      [{ text: "🔗 لینک اختصاصی چت" }, { text: "🔎 ارتباط با آیدی" }],
+      [{ text: "🔗 لینک ناشناس من" }, { text: "🔎 ارتباط با آیدی" }],
       [{ text: "🔔 اعلان‌ها" }],
       [{ text: "🏠 منوی اصلی" }]
     ]);
 }
 
 export async function renderPersonalLink(env, userId, chatId) {
-  if (String(userId) !== String(chatId)) return false;
+  if (!Number.isSafeInteger(userId) || userId <= 0 ||
+      !Number.isSafeInteger(chatId) || userId !== chatId) return false;
   const username = await botUsername(env);
   if (!username) {
     await sendTelegram(env, chatId,
@@ -720,26 +751,36 @@ async function activeConversation(env, firstUserId, secondUserId, sourceType) {
   return row?.id ?? null;
 }
 
-async function hasPairBlock(env, firstUserId, secondUserId, sourceType) {
+async function pairBlockState(env, firstUserId, secondUserId, sourceType) {
   const userAId = Math.min(Number(firstUserId), Number(secondUserId));
   const userBId = Math.max(Number(firstUserId), Number(secondUserId));
-  const row = await env.CRASH_BOT_DB.prepare(`
-    SELECT 1
+  const rows = await env.CRASH_BOT_DB.prepare(`
+    SELECT b.blocker_id
     FROM anonymous_conversations c
     JOIN conversation_blocks b
       ON b.conversation_type = c.source_type AND b.conversation_id = c.id
     WHERE c.user_a_id = ? AND c.user_b_id = ? AND c.source_type = ?
       AND ((b.blocker_id = ? AND b.blocked_id = ?)
         OR (b.blocker_id = ? AND b.blocked_id = ?))
-    LIMIT 1
   `).bind(
     userAId, userBId, sourceType,
     firstUserId, secondUserId, secondUserId, firstUserId
-  ).first();
-  return Boolean(row);
+  ).all();
+  return {
+    blockedByViewer: (rows.results ?? []).some((row) =>
+      String(row.blocker_id) === String(firstUserId)),
+    blockedByOther: (rows.results ?? []).some((row) =>
+      String(row.blocker_id) === String(secondUserId))
+  };
 }
 
 export async function handlePersonalLinkStart(env, userId, chatId, token) {
+  if (!Number.isSafeInteger(userId) || userId <= 0 ||
+      !Number.isSafeInteger(chatId) || chatId !== userId ||
+      !/^anon_[a-f0-9]{32}$/.test(String(token ?? ""))) {
+    await sendTelegram(env, chatId, "این لینک ناشناس نامعتبر است؛ آن را از گفت‌وگوی خصوصی ربات باز کن.");
+    return true;
+  }
   const row = await env.CRASH_BOT_DB.prepare(`
     SELECT l.user_id, u.account_status, u.is_blocked
     FROM anonymous_personal_links l
@@ -752,7 +793,10 @@ export async function handlePersonalLinkStart(env, userId, chatId, token) {
     await sendTelegram(env, chatId, "این لینک ناشناس معتبر یا در دسترس نیست.");
     return true;
   }
-  if (await hasPairBlock(env, userId, row.user_id, "personal_link")) {
+  const blocks = await pairBlockState(
+    env, userId, row.user_id, "personal_link"
+  );
+  if (blocks.blockedByViewer) {
     await sendTelegram(env, chatId, "این گفت‌وگو در این مسیر مسدود شده است.");
     return true;
   }
@@ -820,14 +864,25 @@ function tehranTime(value) {
 }
 
 async function renderOpenedMessage(env, chatId, row) {
+  const reference = threadReference(
+    row.source_type, row.conversation_id, row.session_id, row.connection_id
+  );
+  if (String(row.recipient_id) !== String(chatId) ||
+      String(row.sender_id) === String(chatId) ||
+      await isConversationBlocked(env, reference, chatId, row.sender_id)) {
+    return "blocked";
+  }
   const label = SOURCE_LABELS[row.source_type];
   const header = `💬 پیام دریافتی · ${label}`;
+  const blocks = await conversationBlockState(
+    env, reference, chatId, row.sender_id
+  );
   const keyboard = conversationMessageControls({
     ...row,
     id: row.message_id,
     sender_id: row.sender_id,
     view_delivery_status: "sent"
-  }, chatId, { includeHistory: true });
+  }, chatId, { includeHistory: true, ...blocks });
   const result = await sendConversationContent(env, chatId, {
     text: `${header}\n\n${row.message || row.caption || "رسانه"}`,
     mediaType: row.media_type,
@@ -850,10 +905,10 @@ async function sendSenderViewedNotice(env, notificationId, senderId) {
     WHERE id = (SELECT message_id FROM anonymous_message_inbox WHERE id = ?)
       AND sender_id = ?
   `).bind(notificationId, senderId).first();
-  const sent = await sendMessageTelegramDetailed(env, senderId,
+  const sent = await sendConversationReadReceipt(env, senderId,
+    message?.source_message_id ?? null,
     "✅ پیام شما از طریق ربات مشاهده شد.",
-    null,
-    message?.source_message_id ?? null);
+  );
   const status = sent.outcome === "sent" ? "sent"
     : sent.outcome === "rejected" ? "failed" : "unknown";
   await env.CRASH_BOT_DB.prepare(`
@@ -863,11 +918,30 @@ async function sendSenderViewedNotice(env, notificationId, senderId) {
   return status === "sent";
 }
 
+async function conversationBlockState(env, reference, actorId, peerId) {
+  if (!reference?.id || !Number.isSafeInteger(Number(actorId)) ||
+      !Number.isSafeInteger(Number(peerId)) || String(actorId) === String(peerId)) {
+    return { blockedByViewer: false, blockedByOther: false };
+  }
+  const rows = await env.CRASH_BOT_DB.prepare(`
+    SELECT blocker_id FROM conversation_blocks
+    WHERE conversation_type = ? AND conversation_id = ?
+      AND ((blocker_id = ? AND blocked_id = ?)
+        OR (blocker_id = ? AND blocked_id = ?))
+  `).bind(reference.type, reference.id, actorId, peerId, peerId, actorId).all();
+  return {
+    blockedByViewer: (rows.results ?? []).some((row) =>
+      String(row.blocker_id) === String(actorId)),
+    blockedByOther: (rows.results ?? []).some((row) =>
+      String(row.blocker_id) === String(peerId))
+  };
+}
+
 async function activateOpenedConversation(env, row, actorId) {
   if (row.source_type === "connection") {
     const request = await env.CRASH_BOT_DB.prepare(`
       SELECT id FROM connection_requests
-      WHERE id = ? AND status = 'accepted'
+      WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
         AND (requester_id = ? OR recipient_id = ?)
     `).bind(row.connection_id, actorId, actorId).first();
     if (!request) return "این ارتباط دیگر فعال نیست؛ پیام فقط برای مشاهده باز شد.";
@@ -944,6 +1018,16 @@ async function openInboxItem(env, query, actorId) {
     await answerCallbackQuery(env, query.id, "این اعلان در دسترس نیست.");
     return true;
   }
+  const reference = threadReference(
+    row.source_type, row.conversation_id, row.session_id, row.connection_id
+  );
+  if (String(row.recipient_id) !== String(actorId) ||
+      String(row.sender_id) === String(actorId) ||
+      await isConversationBlocked(env, reference, actorId, row.sender_id)) {
+    await answerCallbackQuery(env, query.id,
+      "این پیام تا رفع محدودیت بلاک در دسترس نیست.");
+    return true;
+  }
   if (row.viewed_at) {
     const responseHint = await activateOpenedConversation(env, row, actorId);
     await sendMessageTelegramDetailed(
@@ -995,6 +1079,11 @@ async function openInboxItem(env, query, actorId) {
         : "Telegram rejected message display",
       notificationId
     ).run();
+    if (outcome === "blocked") {
+      await answerCallbackQuery(env, query.id,
+        "این پیام تا رفع محدودیت بلاک در دسترس نیست.");
+      return true;
+    }
     await answerCallbackQuery(env, query.id,
       outcome === "unknown"
         ? "نتیجهٔ نمایش نامشخص است؛ برای جلوگیری از نمایش تکراری دوباره تلاش نمی‌شود."
@@ -1045,7 +1134,7 @@ async function isThreadActive(env, row, actorId) {
   if (row.source_type === "connection") {
     return Boolean(await env.CRASH_BOT_DB.prepare(`
       SELECT id FROM connection_requests
-      WHERE id = ? AND status = 'accepted'
+      WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
         AND (requester_id = ? OR recipient_id = ?)
     `).bind(row.connection_id, actorId, actorId).first());
   }
@@ -1138,7 +1227,9 @@ async function blockConversationFromMessage(env, query, actorId) {
   );
   const peerId = String(row.sender_id) === String(actorId)
     ? row.recipient_id : row.sender_id;
-  if (!reference.id || !peerId || String(peerId) === String(actorId)) {
+  if (!reference.id || !Number.isSafeInteger(Number(peerId)) ||
+      String(peerId) === String(actorId) ||
+      !await isThreadActive(env, row, actorId)) {
     await answerCallbackQuery(env, query.id, "شناسهٔ گفت‌وگو معتبر نیست.");
     return true;
   }
@@ -1152,31 +1243,88 @@ async function blockConversationFromMessage(env, query, actorId) {
     await env.CRASH_BOT_DB.prepare(`
       DELETE FROM user_conversations
       WHERE flow_type = 'connection_chat' AND entity_id = ?
-        AND user_id IN (?, ?)
-    `).bind(reference.id, actorId, peerId).run();
+        AND user_id = ?
+    `).bind(reference.id, actorId).run();
   } else if (["personal_link", "username"].includes(reference.type)) {
     await env.CRASH_BOT_DB.prepare(`
       DELETE FROM anonymous_chat_states
-      WHERE conversation_id = ? AND user_id IN (?, ?)
-    `).bind(reference.id, actorId, peerId).run();
+      WHERE conversation_id = ? AND user_id = ?
+    `).bind(reference.id, actorId).run();
   }
   await env.CRASH_BOT_DB.batch([
     env.CRASH_BOT_DB.prepare(`
       DELETE FROM active_conversation_selections
       WHERE conversation_type = ? AND conversation_id = ?
-        AND actor_id IN (?, ?)
-    `).bind(reference.type, reference.id, actorId, peerId),
+        AND actor_id = ?
+    `).bind(reference.type, reference.id, actorId),
     env.CRASH_BOT_DB.prepare(`
       DELETE FROM conversation_reply_contexts
       WHERE conversation_type = ? AND conversation_id = ?
-        AND actor_id IN (?, ?)
-    `).bind(reference.type, reference.id, actorId, peerId)
+        AND actor_id = ?
+    `).bind(reference.type, reference.id, actorId)
   ]);
   await sendMessageTelegramDetailed(env, actorId,
     "این گفت‌وگوی ناشناس مسدود شد؛ ارتباط‌های دیگر شما تغییری نکردند.");
   await sendMessageTelegramDetailed(env, peerId,
     "این گفت‌وگوی ناشناس توسط طرف مقابل مسدود شد.");
-  await answerCallbackQuery(env, query.id, "گفت‌وگو مسدود شد.");
+  const keyboard = conversationMessageControls({
+    ...row,
+    id: row.message_id,
+    visibility_status: "visible",
+    view_delivery_status: "sent"
+  }, actorId, { blockedByViewer: true });
+  const edited = await editTelegramReplyMarkupDetailed(
+    env, query.message.chat.id, query.message.message_id, keyboard
+  );
+  await answerCallbackQuery(env, query.id, edited.outcome === "sent"
+    ? "گفت‌وگو مسدود شد."
+    : "گفت‌وگو مسدود شد، اما دکمه به‌روزرسانی نشد؛ صفحه را دوباره باز کن.");
+  return true;
+}
+
+async function unblockConversationFromMessage(env, query, actorId) {
+  const match = /^anon:unblock:(\d+)$/.exec(query.data ?? "");
+  if (!match) return false;
+  const messageId = Number(match[1]);
+  const row = Number.isSafeInteger(messageId) && messageId > 0
+    ? await loadConversationMessage(env, messageId, actorId)
+    : null;
+  if (!row) {
+    await answerCallbackQuery(env, query.id, "این گفت‌وگو در دسترس نیست.");
+    return true;
+  }
+  const reference = threadReference(
+    row.source_type, row.conversation_id, row.session_id, row.connection_id
+  );
+  const peerId = String(row.sender_id) === String(actorId)
+    ? row.recipient_id : row.sender_id;
+  if (!Number.isSafeInteger(Number(peerId)) || String(peerId) === String(actorId) ||
+      !await isThreadActive(env, row, actorId)) {
+    await answerCallbackQuery(env, query.id, "این ارتباط دیگر فعال نیست.");
+    return true;
+  }
+  const removed = await env.CRASH_BOT_DB.prepare(`
+    DELETE FROM conversation_blocks
+    WHERE conversation_type = ? AND conversation_id = ?
+      AND blocker_id = ? AND blocked_id = ?
+    RETURNING conversation_id
+  `).bind(reference.type, reference.id, actorId, peerId).first();
+  if (!removed) {
+    await answerCallbackQuery(env, query.id, "این گفت‌وگو قبلاً رفع بلاک شده است.");
+    return true;
+  }
+  const keyboard = conversationMessageControls({
+    ...row,
+    id: row.message_id,
+    visibility_status: "visible",
+    view_delivery_status: "sent"
+  }, actorId);
+  const edited = await editTelegramReplyMarkupDetailed(
+    env, query.message.chat.id, query.message.message_id, keyboard
+  );
+  await answerCallbackQuery(env, query.id, edited.outcome === "sent"
+    ? "گفت‌وگو رفع بلاک شد."
+    : "گفت‌وگو رفع بلاک شد، اما دکمه به‌روزرسانی نشد؛ صفحه را دوباره باز کن.");
   return true;
 }
 
@@ -1202,10 +1350,32 @@ async function unblockAndViewMessage(env, query, actorId) {
   }
 
   if (row.status === "released" && row.released_message_id) {
+    const blocks = await conversationBlockState(
+      env,
+      { type: row.conversation_type, id: row.conversation_id },
+      actorId,
+      row.sender_id
+    );
+    if (blocks.blockedByViewer || blocks.blockedByOther) {
+      await answerCallbackQuery(env, query.id,
+        "این پیام تا رفع محدودیت بلاک در دسترس نیست.");
+      return true;
+    }
     const inbox = await env.CRASH_BOT_DB.prepare(`
       SELECT id FROM anonymous_message_inbox WHERE message_id = ?
     `).bind(row.released_message_id).first();
     if (inbox) {
+      const blocks = await conversationBlockState(
+        env,
+        { type: row.conversation_type, id: row.conversation_id },
+        actorId,
+        row.sender_id
+      );
+      if (blocks.blockedByViewer || blocks.blockedByOther) {
+        await answerCallbackQuery(env, query.id,
+          "این پیام تا رفع محدودیت بلاک در دسترس نیست.");
+        return true;
+      }
       return openInboxItem(env, {
         ...query,
         data: `anon:inbox:open:${inbox.id}`
@@ -1216,6 +1386,17 @@ async function unblockAndViewMessage(env, query, actorId) {
   }
 
   if (row.status === "releasing") {
+    const currentBlocks = await conversationBlockState(
+      env,
+      { type: row.conversation_type, id: row.conversation_id },
+      actorId,
+      row.sender_id
+    );
+    if (currentBlocks.blockedByOther) {
+      await answerCallbackQuery(env, query.id,
+        "طرف مقابل نیز شما را بلاک کرده است؛ پیام قابل مشاهده نیست.");
+      return true;
+    }
     const recovered = await env.CRASH_BOT_DB.prepare(`
       SELECT id FROM anonymous_messages
       WHERE sender_id = ? AND source_message_id = ? AND message_type = ?
@@ -1256,7 +1437,46 @@ async function unblockAndViewMessage(env, query, actorId) {
         await answerCallbackQuery(env, query.id, "درخواست مشاهده در حال انجام است؛ کمی صبر کن.");
         return true;
       }
+      await env.CRASH_BOT_DB.prepare(`
+        INSERT INTO conversation_blocks
+          (conversation_type, conversation_id, blocker_id, blocked_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(conversation_type, conversation_id, blocker_id) DO NOTHING
+      `).bind(
+        row.conversation_type, row.conversation_id, actorId, row.sender_id
+      ).run();
     }
+  }
+
+  const [recipientBlock, senderBlock] = await Promise.all([
+    env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM conversation_blocks
+      WHERE conversation_type = ? AND conversation_id = ?
+        AND blocker_id = ? AND blocked_id = ?
+    `).bind(
+      row.conversation_type, row.conversation_id, actorId, row.sender_id
+    ).first(),
+    env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM conversation_blocks
+      WHERE conversation_type = ? AND conversation_id = ?
+        AND blocker_id = ? AND blocked_id = ?
+    `).bind(
+      row.conversation_type, row.conversation_id, row.sender_id, actorId
+    ).first()
+  ]);
+  if (!recipientBlock) {
+    await answerCallbackQuery(env, query.id, "این بلاک دیگر فعال نیست.");
+    return true;
+  }
+  if (senderBlock) {
+    await answerCallbackQuery(env, query.id,
+      "طرف مقابل نیز شما را بلاک کرده است؛ پیام قابل مشاهده نیست.");
+    return true;
+  }
+  if (row.status !== "pending" && recipientBlock) {
+    await answerCallbackQuery(env, query.id,
+      "این پیام تا رفع محدودیت بلاک در دسترس نیست.");
+    return true;
   }
 
   const claim = await env.CRASH_BOT_DB.prepare(`
@@ -1270,11 +1490,29 @@ async function unblockAndViewMessage(env, query, actorId) {
     return true;
   }
 
-  await env.CRASH_BOT_DB.prepare(`
+  const removedBlock = await env.CRASH_BOT_DB.prepare(`
     DELETE FROM conversation_blocks
     WHERE conversation_type = ? AND conversation_id = ?
       AND blocker_id = ? AND blocked_id = ?
-  `).bind(row.conversation_type, row.conversation_id, actorId, row.sender_id).run();
+      AND NOT EXISTS (
+        SELECT 1 FROM conversation_blocks
+        WHERE conversation_type = ? AND conversation_id = ?
+          AND blocker_id = ? AND blocked_id = ?
+      )
+    RETURNING id
+  `).bind(
+    row.conversation_type, row.conversation_id, actorId, row.sender_id,
+    row.conversation_type, row.conversation_id, row.sender_id, actorId
+  ).first();
+  if (!removedBlock) {
+    await env.CRASH_BOT_DB.prepare(`
+      UPDATE anonymous_blocked_messages SET status = 'pending',
+        updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'releasing'
+    `).bind(row.id).run();
+    await answerCallbackQuery(env, query.id,
+      "وضعیت بلاک تغییر کرده است؛ پیام قابل مشاهده نیست.");
+    return true;
+  }
 
   const inserted = await appendAndNotify(env, {
     senderId: row.sender_id,
@@ -1297,10 +1535,20 @@ async function unblockAndViewMessage(env, query, actorId) {
     skipRecipientNotification: true
   });
   if (!inserted.messageId || inserted.status !== "sent") {
-    await env.CRASH_BOT_DB.prepare(`
+    await env.CRASH_BOT_DB.batch([
+      env.CRASH_BOT_DB.prepare(`
+        INSERT INTO conversation_blocks
+          (conversation_type, conversation_id, blocker_id, blocked_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(conversation_type, conversation_id, blocker_id) DO NOTHING
+      `).bind(
+        row.conversation_type, row.conversation_id, actorId, row.sender_id
+      ),
+      env.CRASH_BOT_DB.prepare(`
       UPDATE anonymous_blocked_messages SET status = 'pending',
         updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'releasing'
-    `).bind(row.id).run();
+      `).bind(row.id)
+    ]);
     await answerCallbackQuery(env, query.id,
       "ارتباط دیگر فعال نیست یا پیام هنوز قابل مشاهده نیست.");
     return true;
@@ -1340,9 +1588,18 @@ async function replayConversationMessage(
   const reply = message.reply_to_message_id
     ? `\n↪️ پاسخ به پیام ذخیره‌شدهٔ #${message.reply_to_message_id}`
     : "";
-  const keyboard = conversationMessageControls(message, actorId, {
+  const peerId = String(message.sender_id) === String(actorId)
+    ? message.recipient_id : message.sender_id;
+  const blocks = await conversationBlockState(env, reference, actorId, peerId);
+  const hiddenByBlock = String(message.sender_id) !== String(actorId) &&
+    (blocks.blockedByViewer || blocks.blockedByOther);
+  const keyboard = conversationMessageControls({
+    ...message,
+    source_type: reference.type
+  }, actorId, {
     includeHistory: true,
-    historyPage: page
+    historyPage: page,
+    ...blocks
   });
   const remember = async (result) => {
     const messageIds = result?.messageIds ?? [result?.messageId];
@@ -1360,10 +1617,12 @@ async function replayConversationMessage(
   };
   const content = String(message.message || message.caption || "رسانه");
   const result = await sendConversationContent(env, actorId, {
-    text: `${heading}${reply}\n\n${content}`.slice(0, 4096),
-    mediaType: message.media_type,
-    mediaFileId: message.media_file_id,
-    inlineKeyboard: keyboard
+    text: hiddenByBlock
+      ? `${heading}\n\nاین پیام به‌دلیل وضعیت بلاک فعلی مخفی است.`
+      : `${heading}${reply}\n\n${content}`.slice(0, 4096),
+    mediaType: hiddenByBlock ? null : message.media_type,
+    mediaFileId: hiddenByBlock ? null : message.media_file_id,
+    inlineKeyboard: hiddenByBlock && blocks.blockedByOther ? null : keyboard
   });
   return remember(result);
 }
@@ -1381,7 +1640,7 @@ export async function renderRecentConversationMessages(
   if (reference.type === "connection") {
     active = await env.CRASH_BOT_DB.prepare(`
       SELECT id FROM connection_requests
-      WHERE id = ? AND status = 'accepted'
+      WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
         AND (requester_id = ? OR recipient_id = ?)
     `).bind(reference.id, actorId, actorId).first();
     column = "connection_id";
@@ -1405,10 +1664,10 @@ export async function renderRecentConversationMessages(
   if (!active) return false;
 
   const messages = await env.CRASH_BOT_DB.prepare(`
-    SELECT id, sender_id, message, caption, media_type, media_file_id,
+    SELECT id, sender_id, recipient_id, message, caption, media_type, media_file_id,
       reply_to_message_id, created_at
     FROM (
-      SELECT id, sender_id, message, caption, media_type, media_file_id,
+      SELECT id, sender_id, recipient_id, message, caption, media_type, media_file_id,
         reply_to_message_id, created_at
       FROM anonymous_messages
       WHERE ${column} = ?
@@ -1443,6 +1702,10 @@ async function renderConversationHistory(env, query, actorId, sourceMessageId, p
   const reference = threadReference(
     origin.source_type, origin.conversation_id, origin.session_id, origin.connection_id
   );
+  if (reference.type !== "connection") {
+    await answerCallbackQuery(env, query.id, "این بخش تاریخچه ندارد.");
+    return true;
+  }
   const column = reference.type === "random_chat" ? "session_id"
     : reference.type === "connection" ? "connection_id" : "conversation_id";
   const total = Number((await env.CRASH_BOT_DB.prepare(`
@@ -1452,7 +1715,7 @@ async function renderConversationHistory(env, query, actorId, sourceMessageId, p
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const currentPage = Math.min(page, pageCount - 1);
   const messages = await env.CRASH_BOT_DB.prepare(`
-    SELECT id, sender_id, message, caption, media_type, media_file_id,
+    SELECT id, sender_id, recipient_id, message, caption, media_type, media_file_id,
       reply_to_message_id, created_at
     FROM anonymous_messages WHERE ${column} = ?
     ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?
@@ -2139,6 +2402,9 @@ export async function handleAnonymousChatCallback(env, query) {
   if (data.startsWith("anon:block:")) {
     return blockConversationFromMessage(env, query, actorId);
   }
+  if (data.startsWith("anon:unblock:")) {
+    return unblockConversationFromMessage(env, query, actorId);
+  }
   const history = /^anon:history:(\d+):(\d+)$/.exec(data);
   if (history) {
     return renderConversationHistory(
@@ -2155,27 +2421,34 @@ async function handleUsernameLookup(env, message, userId) {
   `).bind(userId).first();
   if (state?.state !== "username_lookup") return false;
   const input = messageContent(message);
-  const match = /^@([A-Za-z0-9_]{5,32})$/.exec(input);
-  if (!match) {
+  const telegramId = /^\d{1,16}$/.test(input) ? Number(input) : null;
+  const username = telegramId === null
+    ? /^@?([A-Za-z0-9_]{5,32})$/.exec(input)
+    : null;
+  if (!username && (!Number.isSafeInteger(telegramId) || telegramId <= 0)) {
     await sendTelegram(env, message.chat.id,
-      "آیدی را دقیقاً با قالب @username بفرست.");
+      "نام کاربری معتبر مانند @username یا شناسهٔ عددی تلگرام را بفرست.");
     return true;
   }
   const target = await env.CRASH_BOT_DB.prepare(`
-    SELECT telegram_id, is_blocked, account_status
+    SELECT telegram_id, is_blocked, account_status, started_at
     FROM users
-    WHERE lower(replace(username, '@', '')) = lower(?)
-      AND started_at IS NOT NULL
+    WHERE (? IS NOT NULL AND lower(replace(username, '@', '')) = lower(?))
+      OR (? IS NOT NULL AND telegram_id = ?)
     LIMIT 1
-  `).bind(match[1]).first();
+  `).bind(username ? username[1] : null, username ? username[1] : null,
+    telegramId, telegramId).first();
   if (!target || target.is_blocked === 1 ||
       (target.account_status && target.account_status !== "active") ||
-      String(target.telegram_id) === String(userId)) {
+      String(target.telegram_id) === String(userId) || !target.started_at) {
     await sendTelegram(env, message.chat.id,
-      "این آیدی در ربات قابل دسترسی نیست؛ فقط به کاربری پیام می‌رسد که ربات را شروع کرده باشد.");
+      "این کاربر هنوز امکان دریافت پیام خصوصی از ربات را ندارد. از او بخواه ربات را باز کند و «شروع / Start» را بزند، سپس دوباره آیدی را وارد کن.");
     return true;
   }
-  if (await hasPairBlock(env, userId, target.telegram_id, "username")) {
+  const blocks = await pairBlockState(
+    env, userId, target.telegram_id, "username"
+  );
+  if (blocks.blockedByViewer) {
     await sendTelegram(env, message.chat.id,
       "این گفت‌وگو در مسیر ارتباط با آیدی مسدود شده است.");
     return true;
@@ -2196,8 +2469,9 @@ async function handleUsernameLookup(env, message, userId) {
 }
 
 export async function handleAnonymousConversationMessage(env, message, userId) {
-  if (message?.chat?.type !== "private" ||
-      String(message?.chat?.id) !== String(userId)) return false;
+  if (!isPrivateConversationMessage(message, userId)) return false;
+  const text = messageContent(message);
+  if (isBotCommand(message) && !NAVIGATION_TEXTS.has(text)) return false;
   const state = await env.CRASH_BOT_DB.prepare(`
     SELECT state, target_user_id, conversation_id
     FROM anonymous_chat_states WHERE user_id = ?
@@ -2208,7 +2482,6 @@ export async function handleAnonymousConversationMessage(env, message, userId) {
     !["personal_link", "username"].includes(selection.conversation_type) ||
     Number(selection.conversation_id) !== Number(state.conversation_id)
   )) return false;
-  const text = messageContent(message);
   if (NAVIGATION_TEXTS.has(text)) {
     await env.CRASH_BOT_DB.prepare(
       "DELETE FROM anonymous_chat_states WHERE user_id = ?"
@@ -2226,6 +2499,12 @@ export async function handleAnonymousConversationMessage(env, message, userId) {
     return handleUsernameLookup(env, message, userId);
   }
   if (state.state === "username_message") {
+    if (!Number.isSafeInteger(state.target_user_id) || state.target_user_id <= 0 ||
+        state.target_user_id === userId) {
+      await sendTelegram(env, message.chat.id,
+        "ارسال پیام به خودت امکان‌پذیر نیست؛ یک آیدی دیگر انتخاب کن.");
+      return true;
+    }
     const existingConversationId = await activeConversation(
       env, userId, state.target_user_id, "username"
     );

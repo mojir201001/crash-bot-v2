@@ -6,7 +6,11 @@ import {
   sendTelegram
 } from "../telegram/api.js";
 import { getProfile, isProfileComplete } from "./profile.js";
-import { conversationMediaFromMessage } from "./conversation-engine.js";
+import {
+  conversationMediaFromMessage,
+  isBotCommand,
+  isPrivateConversationMessage
+} from "./conversation-engine.js";
 import {
   appendAndNotify,
   clearConversationReplyContext,
@@ -27,6 +31,7 @@ const navigationTexts = new Set([
   CHAT_RETURN_BUTTON,
   "👤 پنل کاربر", "🛠 پنل مدیریت",
   "🎭 ارتباط ناشناس", "🎭 چت ناشناس تصادفی",
+  "🔗 لینک ناشناس من",
   "🔗 لینک اختصاصی چت", "🔎 ارتباط با آیدی", "🔔 اعلان‌ها",
   "👤 پروفایل من", "💌 ثبت پست کراش", "🤝 درخواست‌های ارتباط از کانال",
   "📚 ثبت کراش‌های من", "📢 ثبت درخواست تبلیغات", "📖 راهنما و قوانین"
@@ -334,6 +339,12 @@ export async function joinRandomChat(env, message, userId, requestedGender) {
 }
 
 async function relayRandomMessage(env, message, userId, session) {
+  if (!Number.isSafeInteger(session?.id) || !Number.isSafeInteger(userId) ||
+      userId <= 0 ||
+      (String(session.user_a_id) !== String(userId) &&
+        String(session.user_b_id) !== String(userId))) {
+    return false;
+  }
   if (!Number.isSafeInteger(message?.message_id) || message.message_id <= 0) {
     await sendTelegram(env, message.chat.id, "شناسهٔ پیام معتبر نیست و پیام ثبت نشد.");
     return true;
@@ -381,11 +392,8 @@ async function relayRandomMessage(env, message, userId, session) {
     message,
     sourceMessageId: message.message_id
   });
-  if (["blocked", "inactive"].includes(result.status)) {
-    await sendTelegram(env, message.chat.id,
-      result.status === "blocked"
-        ? "این گفت‌وگو مسدود شده است."
-        : "گفت‌وگو دیگر فعال نیست و پیام ارسال نشد.");
+  if (result.status === "inactive") {
+    await sendTelegram(env, message.chat.id, "گفت‌وگو دیگر فعال نیست و پیام ارسال نشد.");
   } else if (result.status === "invalid") {
     await sendTelegram(env, message.chat.id, "پیام متنی یا رسانهٔ پشتیبانی‌شده بفرست.");
   }
@@ -393,6 +401,10 @@ async function relayRandomMessage(env, message, userId, session) {
 }
 
 export async function handleRandomChatMessage(env, message, userId, destination, text) {
+  if (!isPrivateConversationMessage(message, userId)) return false;
+  if (isBotCommand(message) && !navigationTexts.has(String(text ?? "").trim())) {
+    return false;
+  }
   const randomDestinations = [
     "anonymous", "anonymous_random", "anonymous_gender",
     "anonymous_queue_girl", "anonymous_queue_boy"
@@ -415,7 +427,7 @@ export async function handleRandomChatMessage(env, message, userId, destination,
       return true;
     }
   }
-  if (destination === "anonymous") {
+  if (destination === "anonymous_random") {
     await renderRandomChatHome(env, userId, message.chat.id);
     return true;
   }
@@ -540,7 +552,10 @@ export async function handleRandomChatCallback(env, query) {
   const chatId = query.message?.chat?.id;
   const sessionId = Number(rawId);
   if (query.message?.chat?.type !== "private" ||
-      !actorId || String(actorId) !== String(chatId) ||
+      !Number.isSafeInteger(actorId) || actorId <= 0 ||
+      String(actorId) !== String(chatId) ||
+      !Number.isSafeInteger(query.message?.message_id) ||
+      query.message.message_id <= 0 ||
       !Number.isSafeInteger(sessionId) || sessionId <= 0) {
     await answerCallbackQuery(env, query.id, "این عملیات فقط در گفت‌وگوی خصوصی خودت معتبر است.");
     return true;

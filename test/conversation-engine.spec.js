@@ -3,6 +3,8 @@ import {
   conversationMediaFromMessage,
   conversationMessageControls,
   deliverClaimedConversationMessage,
+  isPrivateConversationMessage,
+  sendConversationReadReceipt,
   sendConversationContent
 } from "../src/services/conversation-engine.js";
 
@@ -73,6 +75,33 @@ describe("shared conversation engine", () => {
         { text: "🚫 مسدود کردن گفت‌وگو", callback_data: "anon:block:14" }
       ]
     ]);
+    expect(conversationMessageControls({
+      id: 15,
+      sender_id: 60,
+      visibility_status: "visible",
+      view_delivery_status: "sent"
+    }, 60, { blockedByViewer: true })[0][0].callback_data)
+      .toBe("anon:unblock:15");
+    expect(conversationMessageControls({
+      id: 16,
+      sender_id: 60,
+      visibility_status: "visible",
+      view_delivery_status: "sent"
+    }, 60, { blockedByOther: true })).toBeNull();
+  });
+
+  it("accepts only actual private messages from the matching safe Telegram user", () => {
+    const message = {
+      from: { id: 50 },
+      chat: { id: 50, type: "private" },
+      message_id: 10,
+      text: "hello"
+    };
+    expect(isPrivateConversationMessage(message, 50)).toBe(true);
+    expect(isPrivateConversationMessage({ ...message, from: { id: 51 } }, 50)).toBe(false);
+    expect(isPrivateConversationMessage({ ...message, chat: { id: 50, type: "group" } }, 50)).toBe(false);
+    expect(isPrivateConversationMessage({ ...message, message_id: 0 }, 50)).toBe(false);
+    expect(isPrivateConversationMessage(message, Number.MAX_SAFE_INTEGER + 1)).toBe(false);
   });
 
   it("settles delivery failures as unknown and does not retry them", async () => {
@@ -138,5 +167,28 @@ describe("shared conversation engine", () => {
     expect(calls[0].payload.reply_markup.inline_keyboard[0][0].callback_data)
       .toBe("anon:reply:1");
     expect(sticker.messageIds).toHaveLength(2);
+  });
+
+  it("replies to read receipts and falls back with the original ID on definite rejection", async () => {
+    const calls = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url, init) => {
+      const payload = JSON.parse(init.body);
+      calls.push(payload);
+      return new Response(JSON.stringify({
+        ok: calls.length > 1,
+        ...(calls.length > 1
+          ? { result: { message_id: 211 } }
+          : { description: "reply target unavailable" })
+      }), {
+        status: calls.length > 1 ? 200 : 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }));
+
+    await expect(sendConversationReadReceipt({}, 50, 117))
+      .resolves.toMatchObject({ outcome: "sent" });
+    expect(calls[0].reply_parameters).toEqual({ message_id: 117 });
+    expect(calls[1].reply_parameters).toBeUndefined();
+    expect(calls[1].text).toContain("#117");
   });
 });

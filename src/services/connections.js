@@ -7,6 +7,7 @@ import {
   sendTelegram
 } from "../telegram/api.js";
 import { calculatePersianAge } from "./profile.js";
+import { isBotCommand, isPrivateConversationMessage } from "./conversation-engine.js";
 import {
   clearPostConversation,
   createDeepLinkToken,
@@ -246,6 +247,65 @@ async function sendConnectionRequestNotification(env, requestId, recipientId) {
     (claimed) => deliverConnectionOutboxNotification(env, claimed)) === "sent";
 }
 
+async function findActiveConnection(env, firstUserId, secondUserId, excludeId = null) {
+  const exclude = excludeId === null ? "" : "AND id <> ?";
+  const statement = env.CRASH_BOT_DB.prepare(`
+    SELECT id FROM connection_requests
+    WHERE status = 'accepted' AND ended_at IS NULL
+      AND ((requester_id = ? AND recipient_id = ?)
+        OR (requester_id = ? AND recipient_id = ?))
+      ${exclude}
+    ORDER BY id LIMIT 1
+  `);
+  return excludeId === null
+    ? statement.bind(firstUserId, secondUserId, secondUserId, firstUserId).first()
+    : statement.bind(
+      firstUserId, secondUserId, secondUserId, firstUserId, excludeId
+    ).first();
+}
+
+async function findConnectionBlock(env, firstUserId, secondUserId, requestId = null) {
+  const statement = env.CRASH_BOT_DB.prepare(`
+    SELECT 1
+    WHERE EXISTS (
+      SELECT 1 FROM user_blocks b
+      WHERE b.lifted_at IS NULL
+        AND ((b.blocker_id = ? AND b.blocked_id = ?)
+          OR (b.blocker_id = ? AND b.blocked_id = ?))
+    ) OR EXISTS (
+      SELECT 1 FROM conversation_blocks b
+      JOIN connection_requests c
+        ON c.id = b.conversation_id AND b.conversation_type = 'connection'
+      WHERE ((c.requester_id = ? AND c.recipient_id = ?)
+          OR (c.requester_id = ? AND c.recipient_id = ?))
+        AND ((b.blocker_id = ? AND b.blocked_id = ?)
+          OR (b.blocker_id = ? AND b.blocked_id = ?))
+    )
+  `);
+  const common = [
+    firstUserId, secondUserId, secondUserId, firstUserId
+  ];
+  const pair = [
+    firstUserId, secondUserId, secondUserId, firstUserId,
+    firstUserId, secondUserId, secondUserId, firstUserId
+  ];
+  return Boolean(await statement.bind(...common, ...pair).first());
+}
+
+async function sendConnectionDecisionNotification(env, requestId, requesterId, status) {
+  const notification = await enqueueNotification(env, {
+    recipientId: requesterId,
+    operation: "connection_decision",
+    entityId: requestId,
+    eventKey: `connection-decision:${requestId}`,
+    messageSnapshot: status === "accepted"
+      ? "درخواست ارتباط پذیرفته شد. گفت‌وگوی رباتی فعال است."
+      : "درخواست ارتباط شما رد شد."
+  });
+  await sendPendingNotification(env, notification,
+    (claimed) => deliverConnectionOutboxNotification(env, claimed));
+}
+
 async function postPermalink(env, postId, messageId) {
   if (!postId || !messageId) return null;
   const [urlRow, idRow] = await Promise.all([
@@ -431,7 +491,7 @@ export async function handleStartToken(env, userId, chatId, token) {
   }
   if (link.type === "connection") {
     const request = await env.CRASH_BOT_DB.prepare(`
-      SELECT id, status, requester_id, recipient_id
+      SELECT id, status, requester_id, recipient_id, ended_at
       FROM connection_requests WHERE id = ?
         AND (requester_id = ? OR recipient_id = ?)
     `).bind(link.entityId, userId, userId).first();
@@ -443,7 +503,11 @@ export async function handleStartToken(env, userId, chatId, token) {
       await sendConnectionRequestNotification(env, request.id, userId);
       return true;
     }
-    if (request.status !== "accepted") {
+    if (request.status !== "accepted" || request.ended_at) {
+      if (request.ended_at) {
+        await sendTelegram(env, chatId, "این ارتباط پایان یافته است.");
+        return true;
+      }
       await sendTelegram(env, chatId, `وضعیت درخواست ارتباط: ${request.status === "rejected" ? "ردشده" : "در انتظار پاسخ"}.`);
       return true;
     }
@@ -469,6 +533,7 @@ export async function handleStartToken(env, userId, chatId, token) {
 }
 
 export async function handleConnectionMessage(env, message, userId) {
+  if (!isPrivateConversationMessage(message, userId)) return false;
   const selection = await getConversationSelection(env, userId);
   if (selection && selection.conversation_type !== "connection") return false;
   const flow = selection
@@ -483,7 +548,8 @@ export async function handleConnectionMessage(env, message, userId) {
     "👤 پنل کاربر", "💌 ثبت پست کراش", "✍️ شروع ثبت پست",
     "🤝 درخواست‌های ارتباط از کانال", "📚 ثبت کراش‌های من"
   ];
-  if (navigation.includes(message.text?.trim())) {
+  const text = String(message.text ?? "").trim();
+  if (navigation.includes(text)) {
     await clearPostConversation(env, userId);
     if (selection?.conversation_type === "connection") {
       await clearConversationSelection(env, userId);
@@ -493,6 +559,7 @@ export async function handleConnectionMessage(env, message, userId) {
     }
     return false;
   }
+  if (isBotCommand(message)) return false;
   if (flow.flow_type === "profile_view") return false;
   if (flow.flow_type === "connection_confirm") {
     await sendTelegram(env, message.chat.id, "برای ثبت درخواست از دکمه‌های تأیید یا لغو استفاده کن.");
@@ -501,7 +568,7 @@ export async function handleConnectionMessage(env, message, userId) {
   if (flow.flow_type !== "connection_chat") return false;
   const request = await env.CRASH_BOT_DB.prepare(`
     SELECT requester_id, recipient_id FROM connection_requests
-    WHERE id = ? AND status = 'accepted'
+    WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
       AND (requester_id = ? OR recipient_id = ?)
   `).bind(flow.entity_id, userId, userId).first();
   if (!request) {
@@ -522,9 +589,7 @@ export async function handleConnectionMessage(env, message, userId) {
   if (result.status === "invalid") {
     await sendTelegram(env, message.chat.id,
       "پیام متنی یا رسانهٔ پشتیبانی‌شده بفرست.");
-  } else if (result.status === "blocked") {
-    await sendTelegram(env, message.chat.id, "این گفت‌وگو مسدود شده است.");
-  } else if (result.status === "inactive") {
+  } else if (result.status === "blocked") {} else if (result.status === "inactive") {
     await sendTelegram(env, message.chat.id,
       "این ارتباط دیگر فعال نیست و پیام ثبت نشد.");
   }
@@ -534,7 +599,11 @@ export async function handleConnectionMessage(env, message, userId) {
 export async function handleConnectionCallback(env, query) {
   const data = query.data ?? "";
   const actorId = query.from?.id;
-  if (!actorId || String(query.message?.chat?.id) !== String(actorId)) {
+  if (!Number.isSafeInteger(actorId) || actorId <= 0 ||
+      !Number.isSafeInteger(query.message?.message_id) ||
+      query.message.message_id <= 0 ||
+      query.message?.chat?.type !== "private" ||
+      String(query.message?.chat?.id) !== String(actorId)) {
     await answerCallbackQuery(env, query.id, "این عملیات فقط در گفت‌وگوی خصوصی ربات در دسترس است.");
     return true;
   }
@@ -551,12 +620,69 @@ export async function handleConnectionCallback(env, query) {
     await sendTelegram(env, query.message.chat.id, "به منوی کاربر برگشتی.");
     return true;
   }
+  const endConfirm = /^connection:end:confirm:(\d+)$/.exec(data);
+  if (endConfirm) {
+    const connectionId = Number(endConfirm[1]);
+    const active = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM connection_requests
+      WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
+        AND (requester_id = ? OR recipient_id = ?)
+    `).bind(connectionId, actorId, actorId).first();
+    if (!active) {
+      await answerCallbackQuery(env, query.id,
+        "این ارتباط فعال نیست یا متعلق به شما نیست.");
+      return true;
+    }
+    await sendInlineTelegram(env, query.message.chat.id,
+      "آیا می‌خواهی این ارتباط را پایان بدهی؟ تاریخچه پیام‌ها حفظ می‌شود.",
+      [[
+        { text: "پایان ارتباط", callback_data: `connection:end:do:${connectionId}` },
+        { text: "لغو", callback_data: `connection:end:cancel:${connectionId}` }
+      ]]);
+    await answerCallbackQuery(env, query.id);
+    return true;
+  }
+  const endCancel = /^connection:end:cancel:(\d+)$/.exec(data);
+  if (endCancel) {
+    await answerCallbackQuery(env, query.id, "پایان ارتباط لغو شد.");
+    return true;
+  }
+  const end = /^connection:end:do:(\d+)$/.exec(data);
+  if (end) {
+    const connectionId = Number(end[1]);
+    const connection = await env.CRASH_BOT_DB.prepare(`
+      UPDATE connection_requests
+      SET ended_at = CURRENT_TIMESTAMP, ended_by = ?
+      WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
+        AND (requester_id = ? OR recipient_id = ?)
+      RETURNING requester_id, recipient_id
+    `).bind(actorId, connectionId, actorId, actorId).first();
+    if (!connection) {
+      await answerCallbackQuery(env, query.id,
+        "این ارتباط قبلاً پایان یافته یا متعلق به شما نیست.");
+      return true;
+    }
+    const peerId = String(connection.requester_id) === String(actorId)
+      ? connection.recipient_id : connection.requester_id;
+    const reference = { type: "connection", id: connectionId };
+    for (const participantId of [actorId, peerId]) {
+      await clearPostConversation(env, participantId);
+      await clearConversationSelection(env, participantId);
+      await clearConversationReplyContext(env, participantId, reference);
+    }
+    await answerCallbackQuery(env, query.id, "ارتباط پایان یافت.");
+    await sendTelegram(env, actorId,
+      "این ارتباط پایان یافت؛ تاریخچه پیام‌ها حفظ شده است.");
+    await sendTelegram(env, peerId,
+      "طرف مقابل این ارتباط را پایان داد؛ تاریخچه پیام‌ها حفظ شده است.");
+    return true;
+  }
   const openChat = /^connection:chat:(\d+)$/.exec(data);
   if (openChat) {
     const connectionId = Number(openChat[1]);
     const active = await env.CRASH_BOT_DB.prepare(`
       SELECT id FROM connection_requests
-      WHERE id = ? AND status = 'accepted'
+      WHERE id = ? AND status = 'accepted' AND ended_at IS NULL
         AND (requester_id = ? OR recipient_id = ?)
     `).bind(connectionId, actorId, actorId).first();
     if (!active) {
@@ -609,19 +735,75 @@ export async function handleConnectionCallback(env, query) {
       await answerCallbackQuery(env, query.id, "درخواست ارتباط امکان‌پذیر نیست.");
       return true;
     }
+    if (await findActiveConnection(env, actorId, post.user_id)) {
+      await clearPostConversation(env, actorId);
+      await answerCallbackQuery(env, query.id,
+        "شما و این کاربر از قبل ارتباط فعال دارید و نیازی به ارسال درخواست جدید نیست.");
+      await sendTelegram(env, query.message.chat.id,
+        "شما و این کاربر از قبل ارتباط فعال دارید و نیازی به ارسال درخواست جدید نیست.");
+      return true;
+    }
+    if (await findConnectionBlock(env, actorId, post.user_id)) {
+      await clearPostConversation(env, actorId);
+      await answerCallbackQuery(env, query.id,
+        "به‌دلیل تنظیمات بلاک، ارسال درخواست ارتباط امکان‌پذیر نیست.");
+      await sendTelegram(env, query.message.chat.id,
+        "به‌دلیل تنظیمات بلاک، ارسال درخواست ارتباط امکان‌پذیر نیست.");
+      return true;
+    }
     const inserted = await env.CRASH_BOT_DB.prepare(`
       INSERT INTO connection_requests (requester_id, recipient_id, post_id, status)
       SELECT ?, ?, ?, 'pending'
       WHERE NOT EXISTS (
         SELECT 1 FROM connection_requests
         WHERE requester_id = ? AND recipient_id = ? AND post_id = ?
+            AND status = 'pending'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM connection_requests
+        WHERE status = 'accepted' AND ended_at IS NULL
+          AND ((requester_id = ? AND recipient_id = ?)
+            OR (requester_id = ? AND recipient_id = ?))
+      ) AND NOT EXISTS (
+        SELECT 1 FROM user_blocks
+        WHERE lifted_at IS NULL
+          AND ((blocker_id = ? AND blocked_id = ?)
+            OR (blocker_id = ? AND blocked_id = ?))
+      ) AND NOT EXISTS (
+        SELECT 1 FROM conversation_blocks b
+        JOIN connection_requests c
+          ON c.id = b.conversation_id AND b.conversation_type = 'connection'
+        WHERE ((c.requester_id = ? AND c.recipient_id = ?)
+          OR (c.requester_id = ? AND c.recipient_id = ?))
+          AND ((b.blocker_id = ? AND b.blocked_id = ?)
+            OR (b.blocker_id = ? AND b.blocked_id = ?))
       )
       ON CONFLICT(requester_id, recipient_id, post_id) WHERE status = 'pending'
       DO NOTHING
       RETURNING id
-    `).bind(actorId, post.user_id, postId, actorId, post.user_id, postId).first();
+    `).bind(
+      actorId, post.user_id, postId,
+      actorId, post.user_id, postId,
+      actorId, post.user_id, post.user_id, actorId,
+      actorId, post.user_id, post.user_id, actorId,
+      actorId, post.user_id, post.user_id, actorId,
+      actorId, post.user_id, post.user_id, actorId
+    ).first();
     await clearPostConversation(env, actorId);
     if (!inserted?.id) {
+      if (await findActiveConnection(env, actorId, post.user_id)) {
+        const notice =
+          "شما و این کاربر از قبل ارتباط فعال دارید و نیازی به ارسال درخواست جدید نیست.";
+        await answerCallbackQuery(env, query.id, notice);
+        await sendTelegram(env, query.message.chat.id, notice);
+        return true;
+      }
+      if (await findConnectionBlock(env, actorId, post.user_id)) {
+        await answerCallbackQuery(env, query.id,
+          "به‌دلیل تنظیمات بلاک، ارسال درخواست ارتباط امکان‌پذیر نیست.");
+        await sendTelegram(env, query.message.chat.id,
+          "به‌دلیل تنظیمات بلاک، ارسال درخواست ارتباط امکان‌پذیر نیست.");
+        return true;
+      }
       await answerCallbackQuery(env, query.id, "درخواست تکراری یا در حال بررسی است.");
       return true;
     }
@@ -639,9 +821,73 @@ export async function handleConnectionCallback(env, query) {
     const result = await env.CRASH_BOT_DB.prepare(`
       UPDATE connection_requests SET status = ?, responded_at = CURRENT_TIMESTAMP
       WHERE id = ? AND recipient_id = ? AND status = 'pending'
-      RETURNING id
-    `).bind(newStatus, requestId, actorId).first();
+        AND (? = 'rejected' OR (
+          NOT EXISTS (
+            SELECT 1 FROM connection_requests active
+            WHERE active.status = 'accepted' AND active.ended_at IS NULL
+              AND active.id <> connection_requests.id
+              AND ((active.requester_id = connection_requests.requester_id
+                  AND active.recipient_id = connection_requests.recipient_id)
+                OR (active.requester_id = connection_requests.recipient_id
+                  AND active.recipient_id = connection_requests.requester_id))
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM user_blocks b
+            WHERE b.lifted_at IS NULL
+              AND ((b.blocker_id = connection_requests.requester_id
+                    AND b.blocked_id = connection_requests.recipient_id)
+                OR (b.blocker_id = connection_requests.recipient_id
+                    AND b.blocked_id = connection_requests.requester_id))
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM conversation_blocks b
+            JOIN connection_requests blocked_connection
+              ON blocked_connection.id = b.conversation_id
+              AND b.conversation_type = 'connection'
+            WHERE ((blocked_connection.requester_id = connection_requests.requester_id
+                  AND blocked_connection.recipient_id = connection_requests.recipient_id)
+                OR (blocked_connection.requester_id = connection_requests.recipient_id
+                  AND blocked_connection.recipient_id = connection_requests.requester_id))
+              AND ((b.blocker_id = connection_requests.requester_id
+                    AND b.blocked_id = connection_requests.recipient_id)
+                OR (b.blocker_id = connection_requests.recipient_id
+                    AND b.blocked_id = connection_requests.requester_id))
+          )
+        ))
+      RETURNING id, requester_id
+    `).bind(newStatus, requestId, actorId, newStatus).first();
     if (!result?.id) {
+      const request = await env.CRASH_BOT_DB.prepare(`
+        SELECT requester_id, recipient_id, status FROM connection_requests
+        WHERE id = ? AND recipient_id = ?
+      `).bind(requestId, actorId).first();
+      if (request?.status === "pending" && newStatus === "accepted") {
+        const active = await findActiveConnection(
+          env, request.requester_id, request.recipient_id, requestId
+        );
+        const blocked = await findConnectionBlock(
+          env, request.requester_id, request.recipient_id, requestId
+        );
+        if (active || blocked) {
+          const rejected = await env.CRASH_BOT_DB.prepare(`
+            UPDATE connection_requests SET status = 'rejected',
+              responded_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND recipient_id = ? AND status = 'pending'
+            RETURNING id, requester_id
+          `).bind(requestId, actorId).first();
+          if (rejected) {
+            const notice = active
+              ? "با فرستنده این درخواست از قبل ارتباط فعال دارید."
+              : "به‌دلیل تنظیمات بلاک، این درخواست قابل پذیرش نیست.";
+            await answerCallbackQuery(env, query.id, notice);
+            await sendTelegram(env, query.message.chat.id, notice);
+            await sendConnectionDecisionNotification(
+              env, rejected.id, rejected.requester_id, "rejected"
+            );
+            return true;
+          }
+        }
+      }
       await answerCallbackQuery(env, query.id, "این درخواست قبلاً پاسخ داده شده یا متعلق به شما نیست.");
       return true;
     }
@@ -652,17 +898,9 @@ export async function handleConnectionCallback(env, query) {
     await sendTelegram(env, query.message.chat.id,
       newStatus === "accepted" ? "ارتباط فعال شد؛ پیام خود را برای گفت‌وگو بفرست." : "درخواست ارتباط رد شد.",
       newStatus === "accepted" ? CHAT_RETURN_KEYBOARD : undefined);
-    const notification = await enqueueNotification(env, {
-      recipientId: requester.requester_id,
-      operation: "connection_decision",
-      entityId: requestId,
-      eventKey: `connection-decision:${requestId}`,
-      messageSnapshot: newStatus === "accepted"
-        ? "درخواست ارتباط پذیرفته شد. گفت‌وگوی رباتی فعال است."
-        : "درخواست ارتباط شما رد شد."
-    });
-    await sendPendingNotification(env, notification,
-      (claimed) => deliverConnectionOutboxNotification(env, claimed));
+    await sendConnectionDecisionNotification(
+      env, requestId, requester.requester_id, newStatus
+    );
     return true;
   }
   const open = /^connection:open:(\d+)$/.exec(data);
@@ -682,10 +920,11 @@ export async function renderConnections(env, userId, chatId, section) {
     ? "recipient_id = ?"
     : section === "outgoing"
       ? "requester_id = ?"
-      : "(requester_id = ? OR recipient_id = ?) AND status = 'accepted'";
+      : "(requester_id = ? OR recipient_id = ?) AND status = 'accepted' AND ended_at IS NULL";
   const bind = section === "active" ? [userId, userId] : [userId];
   const rows = await env.CRASH_BOT_DB.prepare(`
-    SELECT c.id, c.requester_id, c.recipient_id, c.post_id, c.status, c.created_at,
+    SELECT c.id, c.requester_id, c.recipient_id, c.post_id, c.status,
+      c.ended_at, c.created_at,
       requester_profile.nickname AS requester_nickname,
       recipient_profile.nickname AS recipient_nickname
     FROM connection_requests c
@@ -701,14 +940,18 @@ export async function renderConnections(env, userId, chatId, section) {
     return;
   }
   for (const request of rows.results) {
-    const displayStatus = request.status === "accepted" ? "فعال"
+    const displayStatus = request.ended_at ? "پایان‌یافته"
+      : request.status === "accepted" ? "فعال"
       : request.status === "rejected" ? "ردشده" : "در انتظار";
     const peerNickname = String(request.requester_id) === String(userId)
       ? request.recipient_nickname : request.requester_nickname;
-    const keyboard = request.status === "accepted"
+    const keyboard = request.status === "accepted" && !request.ended_at
       ? [[{
         text: section === "active" ? peerNickname || "گفت‌وگوی ناشناس" : "گفت‌وگوی فعال",
         callback_data: `connection:chat:${request.id}`
+      }], [{
+        text: "پایان ارتباط",
+        callback_data: `connection:end:confirm:${request.id}`
       }]]
       : section === "incoming" && request.status === "pending"
         ? [[

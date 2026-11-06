@@ -74,6 +74,12 @@ async function clearFixtures() {
       DELETE FROM connection_requests WHERE requester_id IN (${marks}) OR recipient_id IN (${marks})
     `).bind(...ids, ...ids).run();
     await env.CRASH_BOT_DB.prepare(`
+      DELETE FROM conversation_blocks WHERE blocker_id IN (${marks}) OR blocked_id IN (${marks})
+    `).bind(...ids, ...ids).run();
+    await env.CRASH_BOT_DB.prepare(`
+      DELETE FROM user_blocks WHERE blocker_id IN (${marks}) OR blocked_id IN (${marks})
+    `).bind(...ids, ...ids).run();
+    await env.CRASH_BOT_DB.prepare(`
       DELETE FROM deep_link_tokens WHERE intended_user_id IN (${marks})
         OR entity_id IN (SELECT id FROM posts WHERE user_id IN (${marks}))
     `).bind(...ids, ...ids).run();
@@ -109,7 +115,7 @@ function callback(actorId, data) {
     id: `connection-${Math.random()}`,
     data,
     from: { id: actorId },
-    message: { chat: { id: actorId }, message_id: 888 }
+    message: { chat: { id: actorId, type: "private" }, message_id: 888 }
   };
 }
 
@@ -128,6 +134,263 @@ beforeEach(() => {
 });
 
 describe("channel connection requests and private profile", () => {
+  it("does not create another request for an active connection in either direction", async () => {
+    const first = await createUser();
+    const second = await createUser();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'accepted')
+    `).bind(first, second).run();
+    const firstPost = await createPublishedPost(first);
+    const secondPost = await createPublishedPost(second);
+    const answer = vi.spyOn(telegramApi, "answerCallbackQuery")
+      .mockResolvedValue(true);
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+
+    for (const [requester, postId] of [
+      [first, secondPost],
+      [second, firstPost]
+    ]) {
+      const token = await createDeepLinkToken(env, "connect", postId);
+      await handleStartToken(env, requester, requester, token);
+      await handleConnectionCallback(
+        env, callback(requester, `connection:confirm:${postId}`)
+      );
+    }
+
+    const pair = await env.CRASH_BOT_DB.prepare(`
+      SELECT status, COUNT(*) AS count FROM connection_requests
+      WHERE (requester_id = ? AND recipient_id = ?)
+        OR (requester_id = ? AND recipient_id = ?)
+      GROUP BY status ORDER BY status
+    `).bind(first, second, second, first).all();
+    expect(pair.results).toEqual([{ status: "accepted", count: 1 }]);
+    expect(send.mock.calls.filter((call) =>
+      call[2] === "شما و این کاربر از قبل ارتباط فعال دارید و نیازی به ارسال درخواست جدید نیست."
+    )).toHaveLength(2);
+    expect(answer.mock.calls.filter((call) =>
+      call[2] === "شما و این کاربر از قبل ارتباط فعال دارید و نیازی به ارسال درخواست جدید نیست."
+    )).toHaveLength(2);
+  });
+
+  it("allows a new request after a previous relationship was rejected and rejects blocked pairs", async () => {
+    const first = await createUser();
+    const second = await createUser();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'rejected')
+    `).bind(first, second).run();
+    const postId = await createPublishedPost(second);
+    const token = await createDeepLinkToken(env, "connect", postId);
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 777 });
+
+    await handleStartToken(env, first, first, token);
+    await handleConnectionCallback(
+      env, callback(first, `connection:confirm:${postId}`)
+    );
+    let rows = await env.CRASH_BOT_DB.prepare(`
+      SELECT status FROM connection_requests
+      WHERE requester_id = ? AND recipient_id = ? ORDER BY id
+    `).bind(first, second).all();
+    expect(rows.results.map((row) => row.status)).toEqual(["rejected", "pending"]);
+
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO user_blocks (blocker_id, blocked_id) VALUES (?, ?)
+    `).bind(second, first).run();
+    const reversePost = await createPublishedPost(first);
+    const reverseToken = await createDeepLinkToken(env, "connect", reversePost);
+    await handleStartToken(env, second, second, reverseToken);
+    await handleConnectionCallback(
+      env, callback(second, `connection:confirm:${reversePost}`)
+    );
+    rows = await env.CRASH_BOT_DB.prepare(`
+      SELECT status FROM connection_requests
+      WHERE requester_id = ? AND recipient_id = ? ORDER BY id
+    `).bind(second, first).all();
+    expect(rows.results).toHaveLength(0);
+    expect(send.mock.calls.at(-1)[2])
+      .toContain("به‌دلیل تنظیمات بلاک، ارسال درخواست ارتباط امکان‌پذیر نیست.");
+  });
+
+  it("rejects a stale acceptance when another active connection already exists", async () => {
+    const first = await createUser();
+    const second = await createUser();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'accepted')
+    `).bind(first, second).run();
+    const stale = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'pending') RETURNING id
+    `).bind(second, first).first();
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 778 });
+
+    await handleConnectionCallback(
+      env, callback(first, `connection:decision:${stale.id}:accepted`)
+    );
+
+    const statuses = await env.CRASH_BOT_DB.prepare(`
+      SELECT status, COUNT(*) AS count FROM connection_requests
+      WHERE (requester_id = ? AND recipient_id = ?)
+        OR (requester_id = ? AND recipient_id = ?)
+      GROUP BY status ORDER BY status
+    `).bind(first, second, second, first).all();
+    expect(statuses.results).toEqual([
+      { status: "accepted", count: 1 },
+      { status: "rejected", count: 1 }
+    ]);
+    expect(send.mock.calls.some((call) =>
+      call[2] === "با فرستنده این درخواست از قبل ارتباط فعال دارید."
+    )).toBe(true);
+  });
+
+  it("does not accept a pending request when either participant has blocked the other", async () => {
+    const requester = await createUser();
+    const recipient = await createUser();
+    const pending = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'pending') RETURNING id
+    `).bind(requester, recipient).first();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO user_blocks (blocker_id, blocked_id) VALUES (?, ?)
+    `).bind(requester, recipient).run();
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 780 });
+
+    await handleConnectionCallback(
+      env, callback(recipient, `connection:decision:${pending.id}:accepted`)
+    );
+
+    const row = await env.CRASH_BOT_DB.prepare(`
+      SELECT status FROM connection_requests WHERE id = ?
+    `).bind(pending.id).first();
+    expect(row.status).toBe("rejected");
+    expect(send.mock.calls.some((call) =>
+      call[2] === "به‌دلیل تنظیمات بلاک، این درخواست قابل پذیرش نیست."
+    )).toBe(true);
+    const active = await env.CRASH_BOT_DB.prepare(`
+      SELECT COUNT(*) AS count FROM connection_requests
+      WHERE status = 'accepted'
+        AND ((requester_id = ? AND recipient_id = ?)
+          OR (requester_id = ? AND recipient_id = ?))
+    `).bind(requester, recipient, recipient, requester).first();
+    expect(active.count).toBe(0);
+  });
+
+  it("serializes opposite simultaneous acceptances to one active connection", async () => {
+    const first = await createUser();
+    const second = await createUser();
+    const firstPost = await createPublishedPost(first);
+    const secondPost = await createPublishedPost(second);
+    const forward = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, post_id, status)
+      VALUES (?, ?, ?, 'pending') RETURNING id
+    `).bind(first, second, secondPost).first();
+    const reverse = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, post_id, status)
+      VALUES (?, ?, ?, 'pending') RETURNING id
+    `).bind(second, first, firstPost).first();
+    vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 779 });
+
+    await Promise.all([
+      handleConnectionCallback(
+        env, callback(second, `connection:decision:${forward.id}:accepted`)
+      ),
+      handleConnectionCallback(
+        env, callback(first, `connection:decision:${reverse.id}:accepted`)
+      )
+    ]);
+
+    const statuses = await env.CRASH_BOT_DB.prepare(`
+      SELECT status, COUNT(*) AS count FROM connection_requests
+      WHERE (requester_id = ? AND recipient_id = ?)
+        OR (requester_id = ? AND recipient_id = ?)
+      GROUP BY status ORDER BY status
+    `).bind(first, second, second, first).all();
+    expect(statuses.results.reduce((count, row) =>
+      count + (row.status === "accepted" ? row.count : 0), 0)).toBe(1);
+    expect(statuses.results.reduce((count, row) =>
+      count + (row.status === "pending" ? row.count : 0), 0)).toBe(0);
+    expect(statuses.results.reduce((count, row) =>
+      count + (row.status === "rejected" ? row.count : 0), 0)).toBe(1);
+  });
+
+  it("ends an accepted connection without deleting history and permits a new request on the same post", async () => {
+    const owner = await createUser();
+    const requester = await createUser();
+    const postId = await createPublishedPost(owner);
+    const connection = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, post_id, status)
+      VALUES (?, ?, ?, 'accepted') RETURNING id
+    `).bind(requester, owner, postId).first();
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO anonymous_messages
+        (sender_id, recipient_id, message, message_type, connection_id)
+      VALUES (?, ?, 'تاریخچهٔ حفظ‌شده', 'connection', ?)
+    `).bind(requester, owner, connection.id).run();
+    const inline = vi.spyOn(telegramApi, "sendInlineTelegram").mockResolvedValue(true);
+    const detailed = vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 781 });
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 782 });
+
+    await renderConnections(env, owner, owner, "active");
+    expect(inline.mock.calls.at(-1)[3].flat().map((button) => button.callback_data))
+      .toContain(`connection:end:confirm:${connection.id}`);
+    await handleConnectionCallback(
+      env, callback(owner, `connection:end:confirm:${connection.id}`)
+    );
+    const confirmButton = inline.mock.calls.at(-1)[3].flat()
+      .find((button) => button.text === "پایان ارتباط");
+    expect(confirmButton.callback_data).toBe(`connection:end:do:${connection.id}`);
+    await handleConnectionCallback(env, callback(owner, confirmButton.callback_data));
+
+    const ended = await env.CRASH_BOT_DB.prepare(`
+      SELECT status, ended_at, ended_by FROM connection_requests WHERE id = ?
+    `).bind(connection.id).first();
+    expect(ended).toMatchObject({
+      status: "accepted",
+      ended_by: owner
+    });
+    expect(ended.ended_at).toBeTruthy();
+    const history = await env.CRASH_BOT_DB.prepare(`
+      SELECT message FROM anonymous_messages WHERE connection_id = ?
+    `).bind(connection.id).first();
+    expect(history.message).toBe("تاریخچهٔ حفظ‌شده");
+
+    await renderConnections(env, owner, owner, "active");
+    expect(send.mock.calls.at(-1)[2]).toBe("موردی برای نمایش وجود ندارد.");
+    const token = await createDeepLinkToken(env, "connect", postId);
+    await handleStartToken(env, requester, requester, token);
+    await handleConnectionCallback(
+      env, callback(requester, `connection:confirm:${postId}`)
+    );
+    const requests = await env.CRASH_BOT_DB.prepare(`
+      SELECT id, status, ended_at FROM connection_requests
+      WHERE requester_id = ? AND recipient_id = ? AND post_id = ?
+      ORDER BY id
+    `).bind(requester, owner, postId).all();
+    expect(requests.results).toHaveLength(2);
+    expect(requests.results[0].status).toBe("accepted");
+    expect(requests.results[0].ended_at).toBeTruthy();
+    expect(requests.results[1].status).toBe("pending");
+    expect(detailed).toHaveBeenCalled();
+  });
+
   it("requires explicit confirmation and rejects self or duplicate requests", async () => {
     const owner = await createUser();
     const requester = await createUser();
@@ -251,7 +514,7 @@ describe("channel connection requests and private profile", () => {
 
     await expect(handleConnectionMessage(env, {
       from: { id: first },
-      chat: { id: first },
+      chat: { id: first, type: "private" },
       message_id: 992
     }, first)).resolves.toBe(true);
 
@@ -295,7 +558,7 @@ describe("channel connection requests and private profile", () => {
 
     const chatMessage = {
       from: { id: requester },
-      chat: { id: requester },
+      chat: { id: requester, type: "private" },
       message_id: 991,
       text: "سلام"
     };
@@ -419,7 +682,7 @@ describe("channel connection requests and private profile", () => {
 
     await handleConnectionMessage(env, {
       from: { id: sender },
-      chat: { id: sender },
+      chat: { id: sender, type: "private" },
       message_id: 9991,
       text: "پیام هم‌زمان با مسدودسازی"
     }, sender);
@@ -436,6 +699,67 @@ describe("channel connection requests and private profile", () => {
       )
     `).bind(request.id).first();
     expect(inbox.count).toBe(0);
+  });
+
+  it("toggles a connection block only for that conversation and its participant", async () => {
+    const first = await createUser();
+    const peer = await createUser();
+    const otherPeer = await createUser();
+    const connection = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'accepted') RETURNING id
+    `).bind(first, peer).first();
+    const otherConnection = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO connection_requests (requester_id, recipient_id, status)
+      VALUES (?, ?, 'accepted') RETURNING id
+    `).bind(first, otherPeer).first();
+    const message = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO anonymous_messages
+        (sender_id, recipient_id, message, message_type, connection_id)
+      VALUES (?, ?, 'test', 'connection', ?) RETURNING id
+    `).bind(peer, first, connection.id).first();
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent" });
+    const edit = vi.spyOn(telegramApi, "editTelegramReplyMarkupDetailed")
+      .mockResolvedValue({ outcome: "sent" });
+
+    await anonymousChat.handleAnonymousChatCallback(
+      env, callback(first, `anon:block:${message.id}`)
+    );
+    let rows = await env.CRASH_BOT_DB.prepare(`
+      SELECT conversation_type, conversation_id, blocker_id, blocked_id
+      FROM conversation_blocks
+      WHERE blocker_id = ? AND blocked_id = ?
+    `).bind(first, peer).all();
+    expect(rows.results).toEqual([{
+      conversation_type: "connection",
+      conversation_id: connection.id,
+      blocker_id: first,
+      blocked_id: peer
+    }]);
+    expect(edit.mock.calls[0][3][0][0].callback_data)
+      .toBe(`anon:unblock:${message.id}`);
+
+    await anonymousChat.handleAnonymousChatCallback(
+      env, callback(otherPeer, `anon:unblock:${message.id}`)
+    );
+    rows = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM conversation_blocks
+      WHERE conversation_type = 'connection' AND conversation_id = ?
+    `).bind(connection.id).all();
+    expect(rows.results).toHaveLength(1);
+
+    await anonymousChat.handleAnonymousChatCallback(
+      env, callback(first, `anon:unblock:${message.id}`)
+    );
+    rows = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM conversation_blocks
+      WHERE conversation_type = 'connection' AND conversation_id IN (?, ?)
+    `).bind(connection.id, otherConnection.id).all();
+    expect(rows.results).toHaveLength(0);
+    expect(edit.mock.calls[1][3][0][1].callback_data)
+      .toBe(`anon:block:${message.id}`);
   });
 
   it("shows the complete public profile and interests without exposing private identifiers", async () => {

@@ -89,6 +89,8 @@ function mockTelegram(outcome = "sent") {
   vi.spyOn(telegramApi, "sendMediaTelegramDetailed")
     .mockResolvedValue({ outcome });
   vi.spyOn(telegramApi, "deleteTelegramMessage").mockResolvedValue(true);
+  vi.spyOn(telegramApi, "editTelegramReplyMarkupDetailed")
+    .mockResolvedValue({ outcome: "sent" });
   vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
 }
 
@@ -272,15 +274,18 @@ describe("private advertising inbox", () => {
     });
     const heldNotice = telegramApi.sendInlineTelegramDetailed.mock.calls
       .find((call) => String(call[1]) === String(ownerId) &&
-        String(call[2]).includes("کاربر بلاک‌شده"));
+        String(call[2]).includes("فردی که در حال حاضر بلاک کرده‌اید"));
+    expect(heldNotice?.[2]).toBe(
+      "شما از فردی که در حال حاضر بلاک کرده‌اید یک پیام جدید دارید. برای مشاهده پیام، ابتدا بلاک فرستنده را بردارید."
+    );
     expect(heldNotice?.[3][0][0]).toEqual({
-      text: "🔓 خروج از بلاک و مشاهده",
+      text: "رفع بلاک و مشاهده پیام",
       callback_data: `ad:unblock_view:${blocked.id}`
     });
     const ownerNotice = telegramApi.sendInlineTelegramDetailed.mock.calls
       .filter((call) => String(call[1]) === String(ownerId))
       .map((call) => call[2]).join("\n");
-    expect(ownerNotice).toContain("کاربر بلاک‌شده");
+    expect(ownerNotice).toContain("فردی که در حال حاضر بلاک کرده‌اید");
     expect(ownerNotice).not.toContain("محتوای محرمانهٔ مسدودشده");
 
     await handleAdvertisingCallback(
@@ -307,9 +312,144 @@ describe("private advertising inbox", () => {
     )).toBe(true);
     expect(telegramApi.sendMessageTelegramDetailed.mock.calls.some((call) =>
       call[1] === requesterId &&
-      String(call[2]).includes("طرف مقابل پیام شما را مشاهده کرد") &&
+      String(call[2]).includes("پیام شما خوانده شد") &&
       call[4] === 72
     )).toBe(true);
+  });
+
+  it("supports requester-side blocks and holds owner replies for requester approval", async () => {
+    mockTelegram();
+    const requesterId = await createUser();
+    const ownerId = Number(env.OWNER_TELEGRAM_ID);
+    await openAdvertisingConversation(env, requesterId, requesterId);
+    const conversationId = await conversationFor(requesterId);
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO advertising_conversation_state
+        (actor_id, conversation_id, actor_role)
+      VALUES (?, ?, 'owner')
+      ON CONFLICT(actor_id) DO UPDATE SET
+        conversation_id = excluded.conversation_id,
+        actor_role = 'owner',
+        reply_to_message_id = NULL
+    `).bind(ownerId, conversationId).run();
+
+    await handleAdvertisingMessage(
+      env, message(ownerId, 810, "پیام اولیه مالک"), ownerId
+    );
+    const first = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM advertising_messages
+      WHERE conversation_id = ? AND source_message_id = 810
+    `).bind(conversationId).first();
+    await handleAdvertisingCallback(
+      env, callback(requesterId, `ad:block:${first.id}`)
+    );
+    const requesterBlock = await env.CRASH_BOT_DB.prepare(`
+      SELECT blocker_role, blocker_id FROM advertising_conversation_blocks
+      WHERE conversation_id = ?
+    `).bind(conversationId).first();
+    expect(requesterBlock).toEqual({
+      blocker_role: "requester",
+      blocker_id: requesterId
+    });
+
+    await handleAdvertisingMessage(
+      env, message(ownerId, 811, "پیام خصوصی مالک"), ownerId
+    );
+    const held = await env.CRASH_BOT_DB.prepare(`
+      SELECT id, visibility_status FROM advertising_messages
+      WHERE conversation_id = ? AND source_message_id = 811
+    `).bind(conversationId).first();
+    expect(held.visibility_status).toBe("blocked");
+    const notice = telegramApi.sendInlineTelegramDetailed.mock.calls
+      .filter((call) => call[1] === requesterId &&
+        String(call[2]).includes("در حال حاضر بلاک کرده‌اید"))
+      .at(-1);
+    expect(notice[3][0][0]).toMatchObject({
+      text: "رفع بلاک و مشاهده پیام",
+      callback_data: `ad:unblock_view:${held.id}`
+    });
+    expect(notice[2]).not.toContain("پیام خصوصی مالک");
+
+    await handleAdvertisingCallback(
+      env, callback(requesterId, `ad:unblock_view:${held.id}`)
+    );
+    const released = await env.CRASH_BOT_DB.prepare(`
+      SELECT visibility_status, view_delivery_status
+      FROM advertising_messages WHERE id = ?
+    `).bind(held.id).first();
+    expect(released).toEqual({
+      visibility_status: "visible",
+      view_delivery_status: "sent"
+    });
+    const remaining = await env.CRASH_BOT_DB.prepare(`
+      SELECT COUNT(*) AS count FROM advertising_conversation_blocks
+      WHERE conversation_id = ?
+    `).bind(conversationId).first();
+    expect(remaining.count).toBe(0);
+  });
+
+  it("does not release an advertising message while both sides have blocked each other", async () => {
+    mockTelegram();
+    const requesterId = await createUser();
+    const ownerId = Number(env.OWNER_TELEGRAM_ID);
+    await openAdvertisingConversation(env, requesterId, requesterId);
+    const conversationId = await conversationFor(requesterId);
+    await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO advertising_conversation_state
+        (actor_id, conversation_id, actor_role)
+      VALUES (?, ?, 'owner')
+      ON CONFLICT(actor_id) DO UPDATE SET
+        conversation_id = excluded.conversation_id,
+        actor_role = 'owner',
+        reply_to_message_id = NULL
+    `).bind(ownerId, conversationId).run();
+    await handleAdvertisingMessage(
+      env, message(ownerId, 820, "پیام اولیه"), ownerId
+    );
+    const first = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM advertising_messages
+      WHERE conversation_id = ? AND source_message_id = 820
+    `).bind(conversationId).first();
+    await handleAdvertisingCallback(
+      env, callback(requesterId, `ad:block:${first.id}`)
+    );
+    await handleAdvertisingMessage(
+      env, message(ownerId, 821, "محتوای نباید دیده شود"), ownerId
+    );
+    const held = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM advertising_messages
+      WHERE conversation_id = ? AND source_message_id = 821
+    `).bind(conversationId).first();
+    await handleAdvertisingCallback(
+      env, callback(ownerId, `ad:block:${held.id}`)
+    );
+
+    await handleAdvertisingCallback(
+      env, callback(requesterId, `ad:unblock_view:${held.id}`)
+    );
+
+    const blocks = await env.CRASH_BOT_DB.prepare(`
+      SELECT blocker_role FROM advertising_conversation_blocks
+      WHERE conversation_id = ? ORDER BY blocker_role
+    `).bind(conversationId).all();
+    expect(blocks.results).toEqual([
+      { blocker_role: "owner" },
+      { blocker_role: "requester" }
+    ]);
+    const state = await env.CRASH_BOT_DB.prepare(`
+      SELECT visibility_status, view_delivery_status
+      FROM advertising_messages WHERE id = ?
+    `).bind(held.id).first();
+    expect(state).toEqual({
+      visibility_status: "blocked",
+      view_delivery_status: "pending"
+    });
+    expect(telegramApi.sendInlineTelegramDetailed.mock.calls.some((call) =>
+      call[1] === ownerId &&
+      String(call[2]).includes("محتوای نباید دیده شود")
+    )).toBe(false);
+    expect(telegramApi.answerCallbackQuery.mock.calls.at(-1)?.[2])
+      .toContain("مخفی");
   });
 
   it("routes an explicit reply to its selected advertising message", async () => {
@@ -371,6 +511,50 @@ describe("private advertising inbox", () => {
       WHERE actor_id = ? AND conversation_id = ?
     `).bind(requesterId, conversationId).first();
     expect(state.reply_to_message_id).toBe(original.id);
+  });
+
+  it("shows database-backed advertising block and unblock controls", async () => {
+    mockTelegram();
+    const requesterId = await createUser();
+    const ownerId = Number(env.OWNER_TELEGRAM_ID);
+    await openAdvertisingConversation(env, requesterId, requesterId);
+    await handleAdvertisingMessage(
+      env, message(requesterId, 86, "پیام برای کنترل بلاک"), requesterId
+    );
+    const conversationId = await conversationFor(requesterId);
+    const original = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM advertising_messages
+      WHERE conversation_id = ? AND source_message_id = 86
+    `).bind(conversationId).first();
+
+    await handleAdvertisingCallback(
+      env, callback(ownerId, `ad:block:${original.id}`)
+    );
+    let conversation = await env.CRASH_BOT_DB.prepare(`
+      SELECT blocked_by FROM advertising_conversations WHERE id = ?
+    `).bind(conversationId).first();
+    expect(conversation.blocked_by).toBe(ownerId);
+    const edit = telegramApi.editTelegramReplyMarkupDetailed;
+    expect(edit.mock.calls.at(-1)[3][0][0].callback_data)
+      .toBe(`ad:unblock:${original.id}`);
+
+    await handleAdvertisingCallback(
+      env, callback(requesterId, `ad:unblock:${original.id}`)
+    );
+    conversation = await env.CRASH_BOT_DB.prepare(`
+      SELECT blocked_by FROM advertising_conversations WHERE id = ?
+    `).bind(conversationId).first();
+    expect(conversation.blocked_by).toBe(ownerId);
+
+    await handleAdvertisingCallback(
+      env, callback(ownerId, `ad:unblock:${original.id}`)
+    );
+    conversation = await env.CRASH_BOT_DB.prepare(`
+      SELECT blocked_by FROM advertising_conversations WHERE id = ?
+    `).bind(conversationId).first();
+    expect(conversation.blocked_by).toBeNull();
+    expect(edit.mock.calls.at(-1)[3][0][1].callback_data)
+      .toBe(`ad:block:${original.id}`);
   });
 
   it("rejects forged conversation callbacks from requesters and ordinary admins", async () => {

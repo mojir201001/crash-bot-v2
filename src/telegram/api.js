@@ -271,6 +271,17 @@ export async function editInlineTelegram(
   return result?.ok === true;
 }
 
+export async function editTelegramReplyMarkupDetailed(
+  env, chatId, messageId, inlineKeyboard
+) {
+  const result = await telegramRequestDetailed(env, "editMessageReplyMarkup", {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: { inline_keyboard: inlineKeyboard ?? [] }
+  });
+  return { outcome: result.outcome };
+}
+
 
 const replySectionScreenKey = (chatId) =>
   `ui_section_message:${String(chatId)}`;

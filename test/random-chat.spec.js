@@ -6,6 +6,7 @@ import {
   handleRandomChatMessage,
   joinRandomChat
 } from "../src/services/random-chat.js";
+import * as anonymousChat from "../src/services/anonymous-chat.js";
 import { saveProfileField } from "../src/services/profile.js";
 import { setPostConversation } from "../src/services/posts.js";
 
@@ -308,25 +309,38 @@ describe("random anonymous chat", () => {
     const sessionId = await activeSession(first, second, "woman");
     const delivery = vi.spyOn(telegramApi, "sendInlineTelegramDetailed")
       .mockResolvedValue({ outcome: "sent", messageId: 900 });
+    const senderAck = vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent", messageId: 901 });
     vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
 
     await handleRandomChatMessage(env, message(first, 601, "hello"), first);
     await handleRandomChatMessage(env, message(first, 601, "hello"), first);
-    expect(delivery).toHaveBeenCalledTimes(3);
-    expect(delivery).toHaveBeenCalledWith(
-      env,
-      second,
-      expect.stringContaining("منبع: چت ناشناس تصادفی"),
-      [[expect.objectContaining({ text: "مشاهده پیام" })]]
+
+    const recipientCalls = delivery.mock.calls.filter(
+      ([, chatId]) => String(chatId) === String(second)
     );
-    expect(delivery).toHaveBeenCalledWith(
-      env,
-      first,
-      expect.stringContaining("پیام در تاریخچهٔ گفت‌وگو ثبت شد"),
-      [[expect.objectContaining({ callback_data: expect.stringMatching(/^anon:history:/) })]],
-      null,
-      601
+    expect(recipientCalls.length).toBeGreaterThan(0);
+    expect(
+      recipientCalls.some((call) =>
+        String(call[2]).includes("منبع: چت ناشناس تصادفی")
+      )
+    ).toBe(true);
+
+    const recipientButtons = recipientCalls.flatMap((call) =>
+      Array.isArray(call[3]) ? call[3].flat() : []
     );
+    expect(
+      recipientButtons.some((button) =>
+        String(button.callback_data ?? "").includes("history")
+      )
+    ).toBe(false);
+
+    expect(senderAck).toHaveBeenCalled();
+    expect(
+      senderAck.mock.calls.some((call) =>
+        String(call[1]) === String(first)
+      )
+    ).toBe(true);
     const saved = await env.CRASH_BOT_DB.prepare(`
       SELECT sender_id, recipient_id, message_type, session_id, delivery_status
       FROM anonymous_messages WHERE source_message_id = ? AND message_type = 'random_chat'
@@ -343,6 +357,88 @@ describe("random anonymous chat", () => {
     delivery.mockClear();
     await handleRandomChatMessage(env, message(first, 602, "after end"), first);
     expect(delivery).not.toHaveBeenCalled();
+  });
+
+  it("keeps random-chat block toggles scoped to the active session", async () => {
+    const first = await createUser("man");
+    const second = await createUser("woman");
+    const sessionId = await activeSession(first, second, "woman");
+    const original = await env.CRASH_BOT_DB.prepare(`
+      INSERT INTO anonymous_messages
+        (sender_id, recipient_id, message, message_type, session_id)
+      VALUES (?, ?, 'random test', 'random_chat', ?) RETURNING id
+    `).bind(second, first, sessionId).first();
+    vi.spyOn(telegramApi, "answerCallbackQuery").mockResolvedValue(true);
+    vi.spyOn(telegramApi, "sendMessageTelegramDetailed")
+      .mockResolvedValue({ outcome: "sent" });
+    const edit = vi.spyOn(telegramApi, "editTelegramReplyMarkupDetailed")
+      .mockResolvedValue({ outcome: "sent" });
+
+    await anonymousChat.handleAnonymousChatCallback(
+      env, callback(first, `anon:block:${original.id}`)
+    );
+    let block = await env.CRASH_BOT_DB.prepare(`
+      SELECT conversation_type, conversation_id
+      FROM conversation_blocks WHERE blocker_id = ? AND blocked_id = ?
+    `).bind(first, second).first();
+    expect(block).toEqual({
+      conversation_type: "random_chat",
+      conversation_id: sessionId
+    });
+    expect(edit.mock.calls[0][3][0][0].callback_data)
+      .toBe(`anon:unblock:${original.id}`);
+
+    await anonymousChat.handleAnonymousChatCallback(
+      env, callback(first, `anon:unblock:${original.id}`)
+    );
+    block = await env.CRASH_BOT_DB.prepare(`
+      SELECT id FROM conversation_blocks
+      WHERE conversation_type = 'random_chat' AND conversation_id = ?
+    `).bind(sessionId).first();
+    expect(block).toBeNull();
+    expect(edit.mock.calls[1][3][0][1].callback_data)
+      .toBe(`anon:block:${original.id}`);
+  });
+
+  it("does not relay arbitrary bot commands as anonymous chat messages", async () => {
+    const user = await createUser("man");
+    const peer = await createUser("woman");
+    await activeSession(user, peer, "woman");
+
+    await handleRandomChatMessage(
+      env, message(user, 781, "/help"), user, null, "/help"
+    );
+    const stored = await env.CRASH_BOT_DB.prepare(`
+      SELECT COUNT(*) AS count FROM anonymous_messages
+      WHERE sender_id = ? AND source_message_id = ?
+    `).bind(user, 781).first();
+    expect(stored.count).toBe(0);
+  });
+
+  it("opens the random-chat workflow from its anonymous-menu option", async () => {
+    const user = await createUser("man");
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+
+    await handleRandomChatMessage(
+      env, message(user, 782, "🎭 چت ناشناس تصادفی"),
+      user, "anonymous_random", "🎭 چت ناشناس تصادفی"
+    );
+
+    expect(send.mock.calls.some((call) =>
+      call[2].includes("برای شروع، ترجیح جنسیتی")
+    )).toBe(true);
+  });
+
+  it("leaves the anonymous home option to the three-choice menu router", async () => {
+    const user = await createUser("man");
+    const send = vi.spyOn(telegramApi, "sendTelegram").mockResolvedValue(true);
+
+    await expect(handleRandomChatMessage(
+      env, message(user, 783, "🎭 ارتباط ناشناس"),
+      user, "anonymous", "🎭 ارتباط ناشناس"
+    )).resolves.toBe(false);
+
+    expect(send).not.toHaveBeenCalled();
   });
 
   it("does not expose participant identity or cross into accepted-connection chats", async () => {
